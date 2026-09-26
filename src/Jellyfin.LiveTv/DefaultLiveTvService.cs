@@ -348,15 +348,23 @@ namespace Jellyfin.LiveTv
                 throw new ResourceNotFoundException();
             }
 
-            // Only update if not currently active
+            // Post-padding can be changed even while the recording is active.
+            existingTimer.PostPaddingSeconds = updatedTimer.PostPaddingSeconds;
+            existingTimer.IsPostPaddingRequired = updatedTimer.IsPostPaddingRequired;
+
             if (_recordingsManager.GetActiveRecordingPath(updatedTimer.Id) is null)
             {
+                // Only non-active recordings can have their pre-padding changed.
                 existingTimer.PrePaddingSeconds = updatedTimer.PrePaddingSeconds;
-                existingTimer.PostPaddingSeconds = updatedTimer.PostPaddingSeconds;
-                existingTimer.IsPostPaddingRequired = updatedTimer.IsPostPaddingRequired;
                 existingTimer.IsPrePaddingRequired = updatedTimer.IsPrePaddingRequired;
-
                 _timerManager.Update(existingTimer);
+            }
+            else
+            {
+                // Persist the active timer without restarting the start timer, then notify
+                // the active recording so its dynamic end-time waiter recalculates.
+                _timerManager.AddOrUpdate(existingTimer, false);
+                _recordingsManager.UpdateActiveRecordingTimer(existingTimer);
             }
 
             return Task.CompletedTask;
@@ -556,9 +564,10 @@ namespace Jellyfin.LiveTv
                 var activeRecordingInfo = new ActiveRecordingInfo
                 {
                     CancellationTokenSource = new CancellationTokenSource(),
-                    Timer = timer,
                     Id = timer.Id
                 };
+
+                activeRecordingInfo.UpdateTimer(timer);
 
                 if (_recordingsManager.GetActiveRecordingPath(timer.Id) is not null)
                 {
@@ -583,7 +592,7 @@ namespace Jellyfin.LiveTv
                     CopyProgramInfoToTimerInfo(programInfo, timer);
                 }
 
-                await _recordingsManager.RecordStream(activeRecordingInfo, GetLiveTvChannel(timer), recordingEndDate)
+                await _recordingsManager.RecordStream(activeRecordingInfo, GetLiveTvChannel(timer))
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)

@@ -60,19 +60,30 @@ namespace Jellyfin.LiveTv.IO
 
                 _logger.LogInformation("Copying recording to file {FilePath}", targetFile);
 
-                // The media source is infinite so we need to handle stopping ourselves
-                using var durationToken = new CancellationTokenSource(duration);
-                using var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, durationToken.Token);
-                var linkedCancellationToken = cancellationTokenSource.Token;
                 var fileStream = new ProgressiveFileStream(directStreamProvider.GetStream());
                 await using (fileStream.ConfigureAwait(false))
                 {
-                    await _streamHelper.CopyToAsync(
-                        fileStream,
-                        output,
-                        IODefaults.CopyToBufferSize,
-                        1000,
-                        linkedCancellationToken).ConfigureAwait(false);
+                    if (duration == Timeout.InfiniteTimeSpan)
+                    {
+                        await _streamHelper.CopyToAsync(
+                            fileStream,
+                            output,
+                            IODefaults.CopyToBufferSize,
+                            1000,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        // The media source is infinite so we need to handle stopping ourselves.
+                        using var durationToken = new CancellationTokenSource(duration);
+                        using var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, durationToken.Token);
+                        await _streamHelper.CopyToAsync(
+                            fileStream,
+                            output,
+                            IODefaults.CopyToBufferSize,
+                            1000,
+                            cancellationTokenSource.Token).ConfigureAwait(false);
+                    }
                 }
             }
 
@@ -95,16 +106,26 @@ namespace Jellyfin.LiveTv.IO
 
                 _logger.LogInformation("Copying recording stream to file {0}", targetFile);
 
-                // The media source if infinite so we need to handle stopping ourselves
-                using var durationToken = new CancellationTokenSource(duration);
-                using var linkedCancellationToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, durationToken.Token);
-                cancellationToken = linkedCancellationToken.Token;
+                if (duration == Timeout.InfiniteTimeSpan)
+                {
+                    await _streamHelper.CopyUntilCancelled(
+                        await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false),
+                        output,
+                        IODefaults.CopyToBufferSize,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    // The media source is infinite so we need to handle stopping ourselves.
+                    using var durationToken = new CancellationTokenSource(duration);
+                    using var linkedCancellationToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, durationToken.Token);
 
-                await _streamHelper.CopyUntilCancelled(
-                    await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false),
-                    output,
-                    IODefaults.CopyToBufferSize,
-                    cancellationToken).ConfigureAwait(false);
+                    await _streamHelper.CopyUntilCancelled(
+                        await response.Content.ReadAsStreamAsync(linkedCancellationToken.Token).ConfigureAwait(false),
+                        output,
+                        IODefaults.CopyToBufferSize,
+                        linkedCancellationToken.Token).ConfigureAwait(false);
+                }
 
                 _logger.LogInformation("Recording completed to file {0}", targetFile);
             }

@@ -60,11 +60,18 @@ namespace Jellyfin.LiveTv.IO
 
         public async Task Record(IDirectStreamProvider directStreamProvider, MediaSourceInfo mediaSource, string targetFile, TimeSpan duration, Action onStarted, CancellationToken cancellationToken)
         {
-            // The media source is infinite so we need to handle stopping ourselves
-            using var durationToken = new CancellationTokenSource(duration);
-            using var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, durationToken.Token);
+            if (duration == Timeout.InfiniteTimeSpan)
+            {
+                await RecordFromFile(mediaSource, mediaSource.Path, targetFile, onStarted, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                // The media source is infinite so we need to handle stopping ourselves.
+                using var durationToken = new CancellationTokenSource(duration);
+                using var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, durationToken.Token);
 
-            await RecordFromFile(mediaSource, mediaSource.Path, targetFile, onStarted, cancellationTokenSource.Token).ConfigureAwait(false);
+                await RecordFromFile(mediaSource, mediaSource.Path, targetFile, onStarted, cancellationTokenSource.Token).ConfigureAwait(false);
+            }
 
             _logger.LogInformation("Recording completed to file {Path}", targetFile);
         }
