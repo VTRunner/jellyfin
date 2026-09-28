@@ -26,19 +26,6 @@ public interface IRecordingsManager
     ActiveRecordingInfo? GetActiveRecordingInfo(string path);
 
     /// <summary>
-    /// Updates the timer state for an active recording.
-    /// </summary>
-    /// <param name="timer">The updated timer.</param>
-    void UpdateActiveRecordingTimer(TimerInfo timer);
-
-    /// <summary>
-    /// Attempts to stop an active recording that is currently using optional post-padding.
-    /// </summary>
-    /// <param name="requestingTimerId">The timer id of the recording requesting the tuner.</param>
-    /// <returns><see langword="true"/> if an optional post-padding recording was stopped and its tuner released; otherwise <see langword="false"/>.</returns>
-    Task<bool> TryStopOptionalPostPaddingAsync(string requestingTimerId);
-
-    /// <summary>
     /// Gets the recording folders.
     /// </summary>
     /// <returns>The <see cref="VirtualFolderInfo"/> for each recording folder.</returns>
@@ -62,6 +49,7 @@ public interface IRecordingsManager
     /// </summary>
     /// <param name="recordingInfo">The recording info.</param>
     /// <param name="channel">The channel associated with the recording timer.</param>
+    /// <param name="recordingEndDate">The time to stop recording.</param>
     /// <returns>Task representing the recording process.</returns>
-    Task RecordStream(ActiveRecordingInfo recordingInfo, BaseItem channel);
+    Task RecordStream(ActiveRecordingInfo recordingInfo, BaseItem channel, DateTime recordingEndDate);
 }

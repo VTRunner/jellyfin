@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using AsyncKeyedLock;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Enums;
+using Jellyfin.LiveTv;
 using Jellyfin.LiveTv.Configuration;
 using Jellyfin.LiveTv.IO;
 using Jellyfin.LiveTv.Timers;
@@ -132,7 +133,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         {
             if (string.Equals(recordingInfo.Path, path, StringComparison.Ordinal)
                 && !recordingInfo.CancellationTokenSource.IsCancellationRequested
-                && recordingInfo.IsInProgress)
+                && ActiveRecordingInfoState.IsInProgress(recordingInfo))
             {
                 return recordingInfo;
             }
@@ -141,17 +142,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         return null;
     }
 
-    /// <inheritdoc />
-    public void UpdateActiveRecordingTimer(TimerInfo timer)
-    {
-        if (_activeRecordings.TryGetValue(timer.Id, out var activeRecordingInfo))
-        {
-            activeRecordingInfo.UpdateTimer(timer);
-        }
-    }
-
-    /// <inheritdoc />
-    public async Task<bool> TryStopOptionalPostPaddingAsync(string requestingTimerId)
+    private async Task<bool> TryStopOptionalPostPaddingAsync(string requestingTimerId)
     {
         using (await _postPaddingPreemptionSemaphore.LockAsync().ConfigureAwait(false))
         {
@@ -160,7 +151,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
                 .Where(pair => !string.Equals(pair.Key, requestingTimerId, StringComparison.OrdinalIgnoreCase))
                 .Select(pair =>
                 {
-                    var hasOptionalPadding = pair.Value.TryGetOptionalPostPaddingState(now, out var priority, out var remaining);
+                    var hasOptionalPadding = ActiveRecordingInfoState.TryGetOptionalPostPaddingState(pair.Value, now, out var priority, out var remaining);
                     return (Info: pair.Value, HasOptionalPadding: hasOptionalPadding, Priority: priority, Remaining: remaining);
                 })
                 .Where(candidate => candidate.HasOptionalPadding)
@@ -171,7 +162,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
 
             foreach (var candidate in candidates)
             {
-                if (!candidate.Info.TryClaimOptionalPostPadding(DateTime.UtcNow))
+                if (!ActiveRecordingInfoState.TryClaimOptionalPostPadding(candidate.Info, DateTime.UtcNow))
                 {
                     continue;
                 }
@@ -184,8 +175,8 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
                 await candidate.Info.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
 
                 var timeoutTask = Task.Delay(TimeSpan.FromSeconds(30));
-                var completedTask = await Task.WhenAny(candidate.Info.TunerReleasedTask, timeoutTask).ConfigureAwait(false);
-                if (completedTask == candidate.Info.TunerReleasedTask)
+                var completedTask = await Task.WhenAny(ActiveRecordingInfoState.GetTunerReleasedTask(candidate.Info), timeoutTask).ConfigureAwait(false);
+                if (completedTask == ActiveRecordingInfoState.GetTunerReleasedTask(candidate.Info))
                 {
                     return true;
                 }
@@ -358,7 +349,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         {
             if (timer is not null)
             {
-                activeRecordingInfo.UpdateTimer(timer);
+                ActiveRecordingInfoState.UpdateTimer(activeRecordingInfo, timer);
             }
 
             activeRecordingInfo.CancellationTokenSource.Cancel();
@@ -366,18 +357,18 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
     }
 
     /// <inheritdoc />
-    public async Task RecordStream(ActiveRecordingInfo recordingInfo, BaseItem channel)
+    public async Task RecordStream(ActiveRecordingInfo recordingInfo, BaseItem channel, DateTime recordingEndDate)
     {
         ArgumentNullException.ThrowIfNull(recordingInfo);
         ArgumentNullException.ThrowIfNull(channel);
 
         var timer = _timerManager.GetTimer(recordingInfo.Id) ?? recordingInfo.Timer;
-        recordingInfo.UpdateTimer(timer);
+        ActiveRecordingInfoState.UpdateTimer(recordingInfo, timer);
         recordingInfo.Path = string.Empty;
 
         if (!_activeRecordings.TryAdd(timer.Id, recordingInfo))
         {
-            recordingInfo.TunerReleased();
+            ActiveRecordingInfoState.TunerReleased(recordingInfo);
             _logger.LogInformation("Skipping RecordStream because timer {TimerId} is already being recorded.", timer.Id);
             return;
         }
@@ -432,33 +423,37 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
             if (timer.PostPaddingSeconds <= 0)
             {
                 _logger.LogInformation(
-                    "Beginning recording. Planned duration: {Duration}, ending at {EndDate}. No post-padding.",
+                    "Beginning recording. Planned duration: {Duration}, ending at {EndDate}, including {PrePadding} of pre-padding. No post-padding.",
                     scheduledDuration,
-                    scheduledRecordingEnd);
+                    scheduledRecordingEnd,
+                    TimeSpan.FromSeconds(timer.PrePaddingSeconds));
             }
             else if (timer.IsPostPaddingRequired)
             {
                 _logger.LogInformation(
-                    "Beginning recording. Planned duration: {Duration}, ending at {EndDate}, including {PostPadding} of required post-padding.",
+                    "Beginning recording. Planned duration: {Duration}, ending at {EndDate}, including {PrePadding} of pre-padding and {PostPadding} of required post-padding.",
                     scheduledDuration,
                     scheduledRecordingEnd,
+                    TimeSpan.FromSeconds(timer.PrePaddingSeconds),
                     TimeSpan.FromSeconds(timer.PostPaddingSeconds));
             }
             else
             {
                 _logger.LogInformation(
-                    "Beginning recording. Planned duration: {Duration}, ending at {EndDate}, including {PostPadding} of optional post-padding. Optional post-padding will be recorded unless preempted because the tuner is needed.",
+                    "Beginning recording. Planned duration: {Duration}, ending at {EndDate}, including {PrePadding} of pre-padding and {PostPadding} of optional post-padding. Optional post-padding will be recorded unless preempted because the tuner is needed.",
                     scheduledDuration,
                     scheduledRecordingEnd,
+                    TimeSpan.FromSeconds(timer.PrePaddingSeconds),
                     TimeSpan.FromSeconds(timer.PostPaddingSeconds));
             }
+
             _logger.LogInformation("Writing file to: {Path}", recordingPath);
 
             async void OnStarted()
             {
                 var activeTimer = _timerManager.GetTimer(timer.Id) ?? timer;
                 activeTimer.Status = RecordingStatus.InProgress;
-                if (!recordingInfo.TryMarkStarted(activeTimer))
+                if (!ActiveRecordingInfoState.TryMarkStarted(recordingInfo, activeTimer))
                 {
                     return;
                 }
@@ -477,7 +472,6 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
                 directStreamProvider,
                 mediaStreamInfo,
                 recordingPath,
-                Timeout.InfiniteTimeSpan,
                 OnStarted,
                 recordingInfo.CancellationTokenSource.Token).ConfigureAwait(false);
 
@@ -512,7 +506,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
 
             if (liveStreamClosed)
             {
-                recordingInfo.TunerReleased();
+                ActiveRecordingInfoState.TunerReleased(recordingInfo);
             }
 
             try
@@ -597,13 +591,13 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         {
             while (!recordingInfo.CancellationTokenSource.IsCancellationRequested)
             {
-                var state = recordingInfo.GetTimerState();
+                var state = ActiveRecordingInfoState.GetTimerState(recordingInfo);
                 var recordingEndDate = state.EndDate.AddSeconds(state.PostPaddingSeconds);
                 var remaining = recordingEndDate - DateTime.UtcNow;
 
                 if (remaining <= TimeSpan.Zero)
                 {
-                    if (recordingInfo.TryClaimEndCancellation(DateTime.UtcNow))
+                    if (ActiveRecordingInfoState.TryClaimEndCancellation(recordingInfo, DateTime.UtcNow))
                     {
                         await recordingInfo.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
                         return;
@@ -614,14 +608,14 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
 
                 var delayTask = Task.Delay(remaining, recordingInfo.CancellationTokenSource.Token);
                 var timerChangedTask = state.TimerChangedTask;
-                var completedTask = await Task.WhenAny(delayTask, timerChangedTask, recordingInfo.TunerReleasedTask).ConfigureAwait(false);
+                var completedTask = await Task.WhenAny(delayTask, timerChangedTask, ActiveRecordingInfoState.GetTunerReleasedTask(recordingInfo)).ConfigureAwait(false);
 
-                if (completedTask == recordingInfo.TunerReleasedTask || recordingInfo.CancellationTokenSource.IsCancellationRequested)
+                if (completedTask == ActiveRecordingInfoState.GetTunerReleasedTask(recordingInfo) || recordingInfo.CancellationTokenSource.IsCancellationRequested)
                 {
                     return;
                 }
 
-                if (completedTask == delayTask && recordingInfo.TryClaimEndCancellation(DateTime.UtcNow))
+                if (completedTask == delayTask && ActiveRecordingInfoState.TryClaimEndCancellation(recordingInfo, DateTime.UtcNow))
                 {
                     await recordingInfo.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
                     return;
