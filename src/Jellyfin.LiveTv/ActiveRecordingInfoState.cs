@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Model.LiveTv;
@@ -22,7 +23,8 @@ internal static class ActiveRecordingInfoState
 
     internal static bool IsInProgress(ActiveRecordingInfo info)
     {
-        return States.GetOrCreateValue(info).IsInProgress();
+        ArgumentNullException.ThrowIfNull(info);
+        return States.TryGetValue(info, out var state) && state.IsInProgress();
     }
 
     internal static bool TryMarkStarted(ActiveRecordingInfo info, TimerInfo timer)
@@ -32,33 +34,39 @@ internal static class ActiveRecordingInfoState
         return States.GetOrCreateValue(info).TryMarkStarted(info, timer);
     }
 
-    internal static bool TryGetOptionalPostPaddingState(ActiveRecordingInfo info, DateTime utcNow, out int priority, out TimeSpan remaining)
+    internal static bool TryGetOptionalPostPaddingState(ActiveRecordingInfo info, DateTime utcNow, out TimeSpan remaining)
     {
-        return States.GetOrCreateValue(info).TryGetOptionalPostPaddingState(utcNow, out priority, out remaining);
+        ArgumentNullException.ThrowIfNull(info);
+        return States.GetOrCreateValue(info).TryGetOptionalPostPaddingState(info, utcNow, out remaining);
     }
 
     internal static bool TryClaimOptionalPostPadding(ActiveRecordingInfo info, DateTime utcNow)
     {
-        return States.GetOrCreateValue(info).TryClaimOptionalPostPadding(utcNow);
+        ArgumentNullException.ThrowIfNull(info);
+        return States.GetOrCreateValue(info).TryClaimOptionalPostPadding(info, utcNow);
     }
 
     internal static bool TryClaimEndCancellation(ActiveRecordingInfo info, DateTime utcNow)
     {
+        ArgumentNullException.ThrowIfNull(info);
         return States.GetOrCreateValue(info).TryClaimEndCancellation(utcNow);
     }
 
     internal static (DateTime EndDate, int PostPaddingSeconds, Task TimerChangedTask) GetTimerState(ActiveRecordingInfo info)
     {
+        ArgumentNullException.ThrowIfNull(info);
         return States.GetOrCreateValue(info).GetTimerState();
     }
 
     internal static Task GetTunerReleasedTask(ActiveRecordingInfo info)
     {
+        ArgumentNullException.ThrowIfNull(info);
         return States.GetOrCreateValue(info).TunerReleasedTask;
     }
 
     internal static void TunerReleased(ActiveRecordingInfo info)
     {
+        ArgumentNullException.ThrowIfNull(info);
         States.GetOrCreateValue(info).TunerReleased();
     }
 
@@ -67,29 +75,27 @@ internal static class ActiveRecordingInfoState
 
     private sealed class State
     {
-        private readonly object _sync = new();
+        private readonly Lock _sync = new();
         private readonly TaskCompletionSource<bool> _tunerReleased =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         private TaskCompletionSource<bool> _timerChanged = CreateSignal();
         private DateTime _endDate;
         private int _postPaddingSeconds;
         private bool _isPostPaddingRequired;
-        private int _priority;
         private RecordingStatus _status;
         private bool _postPaddingPreemptionClaimed;
         private bool _endCancellationClaimed;
 
         internal Task TunerReleasedTask => _tunerReleased.Task;
 
+        private DateTime EffectiveEndDate => _endDate.AddSeconds(_postPaddingSeconds);
+
         internal void UpdateTimer(ActiveRecordingInfo info, TimerInfo timer)
         {
             lock (_sync)
             {
-                info.Timer = timer;
-                _endDate = timer.EndDate;
-                _postPaddingSeconds = timer.PostPaddingSeconds;
-                _isPostPaddingRequired = timer.IsPostPaddingRequired;
-                _priority = timer.Priority;
+                SetTimerState(info, timer);
 
                 // Preserve the active-recording state when updating an active timer.
                 // TimerInfo.Status can lag the internal recording state during startup.
@@ -116,59 +122,53 @@ internal static class ActiveRecordingInfoState
         {
             lock (_sync)
             {
-                if (info.CancellationTokenSource.IsCancellationRequested
-                    || _status == RecordingStatus.Cancelled
-                    || timer.Status == RecordingStatus.Cancelled)
+                if (!CanStartRecording(info, timer))
                 {
                     return false;
                 }
 
-                info.Timer = timer;
+                SetTimerState(info, timer);
                 _status = RecordingStatus.InProgress;
-                _endDate = timer.EndDate;
-                _postPaddingSeconds = timer.PostPaddingSeconds;
-                _isPostPaddingRequired = timer.IsPostPaddingRequired;
-                _priority = timer.Priority;
                 return true;
             }
         }
 
-        internal bool TryGetOptionalPostPaddingState(DateTime utcNow, out int priority, out TimeSpan remaining)
+        internal bool TryGetOptionalPostPaddingState(ActiveRecordingInfo info, DateTime utcNow, out TimeSpan remaining)
         {
             lock (_sync)
             {
-                var effectiveEnd = _endDate.AddSeconds(_postPaddingSeconds);
-                if (_status != RecordingStatus.InProgress
-                    || _isPostPaddingRequired
-                    || _postPaddingSeconds <= 0
-                    || utcNow < _endDate
-                    || utcNow >= effectiveEnd)
+                if (info.CancellationTokenSource.IsCancellationRequested)
                 {
-                    priority = 0;
                     remaining = default;
                     return false;
                 }
 
-                priority = _priority;
+                if (!IsInOptionalPostPaddingWindow(utcNow, out var effectiveEnd))
+                {
+                    remaining = default;
+                    return false;
+                }
+
                 remaining = effectiveEnd - utcNow;
                 return true;
             }
         }
 
-        internal bool TryClaimOptionalPostPadding(DateTime utcNow)
+        internal bool TryClaimOptionalPostPadding(ActiveRecordingInfo info, DateTime utcNow)
         {
             lock (_sync)
             {
-                if (_postPaddingPreemptionClaimed
-                    || _status != RecordingStatus.InProgress
-                    || _isPostPaddingRequired
-                    || _postPaddingSeconds <= 0)
+                if (info.CancellationTokenSource.IsCancellationRequested)
                 {
                     return false;
                 }
 
-                var effectiveEnd = _endDate.AddSeconds(_postPaddingSeconds);
-                if (utcNow < _endDate || utcNow >= effectiveEnd)
+                if (_postPaddingPreemptionClaimed)
+                {
+                    return false;
+                }
+
+                if (!IsInOptionalPostPaddingWindow(utcNow, out _))
                 {
                     return false;
                 }
@@ -182,13 +182,17 @@ internal static class ActiveRecordingInfoState
         {
             lock (_sync)
             {
-                if (_endCancellationClaimed || _status != RecordingStatus.InProgress)
+                if (_endCancellationClaimed)
                 {
                     return false;
                 }
 
-                var effectiveEnd = _endDate.AddSeconds(_postPaddingSeconds);
-                if (utcNow < effectiveEnd)
+                if (_status != RecordingStatus.InProgress)
+                {
+                    return false;
+                }
+
+                if (utcNow < EffectiveEndDate)
                 {
                     return false;
                 }
@@ -209,6 +213,36 @@ internal static class ActiveRecordingInfoState
         internal void TunerReleased()
         {
             _tunerReleased.TrySetResult(true);
+        }
+
+        private void SetTimerState(ActiveRecordingInfo info, TimerInfo timer)
+        {
+            info.Timer = timer;
+            _endDate = timer.EndDate;
+            _postPaddingSeconds = timer.PostPaddingSeconds;
+            _isPostPaddingRequired = timer.IsPostPaddingRequired;
+        }
+
+        private bool CanStartRecording(ActiveRecordingInfo info, TimerInfo timer)
+        {
+            return !info.CancellationTokenSource.IsCancellationRequested
+                && _status != RecordingStatus.Cancelled
+                && timer.Status != RecordingStatus.Cancelled;
+        }
+
+        private bool IsInOptionalPostPaddingWindow(DateTime utcNow, out DateTime effectiveEnd)
+        {
+            effectiveEnd = default;
+
+            if (_status != RecordingStatus.InProgress
+                || _isPostPaddingRequired
+                || _postPaddingSeconds <= 0)
+            {
+                return false;
+            }
+
+            effectiveEnd = EffectiveEndDate;
+            return utcNow >= _endDate && utcNow < effectiveEnd;
         }
     }
 }

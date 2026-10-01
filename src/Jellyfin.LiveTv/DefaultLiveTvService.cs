@@ -567,8 +567,8 @@ namespace Jellyfin.LiveTv
                 var activeRecordingInfo = new ActiveRecordingInfo
                 {
                     CancellationTokenSource = new CancellationTokenSource(),
-                    Id = timer.Id,
-                    Timer = timer
+                    Timer = timer,
+                    Id = timer.Id
                 };
 
                 if (_recordingsManager.GetActiveRecordingPath(timer.Id) is not null)
