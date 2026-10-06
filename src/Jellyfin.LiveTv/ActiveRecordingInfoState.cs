@@ -58,6 +58,18 @@ internal static class ActiveRecordingInfoState
         return States.GetOrCreateValue(info).GetTimerState();
     }
 
+    internal static void ReservePath(ActiveRecordingInfo info, string path)
+    {
+        ArgumentNullException.ThrowIfNull(info);
+        States.GetOrCreateValue(info).ReservedPath = path;
+    }
+
+    internal static string? GetReservedPath(ActiveRecordingInfo info)
+    {
+        ArgumentNullException.ThrowIfNull(info);
+        return States.TryGetValue(info, out var state) ? state.ReservedPath : null;
+    }
+
     internal static Task GetTunerReleasedTask(ActiveRecordingInfo info)
     {
         ArgumentNullException.ThrowIfNull(info);
@@ -89,6 +101,8 @@ internal static class ActiveRecordingInfoState
 
         internal Task TunerReleasedTask => _tunerReleased.Task;
 
+        internal string? ReservedPath { get; set; }
+
         private DateTime EffectiveEndDate => _endDate.AddSeconds(_postPaddingSeconds);
 
         internal void UpdateTimer(ActiveRecordingInfo info, TimerInfo timer)
@@ -97,11 +111,10 @@ internal static class ActiveRecordingInfoState
             {
                 SetTimerState(info, timer);
 
-                // Preserve the active-recording state when updating an active timer.
-                // TimerInfo.Status can lag the internal recording state during startup.
-                if (_status != RecordingStatus.InProgress)
+                if (_status != RecordingStatus.InProgress
+                    && timer.Status == RecordingStatus.Cancelled)
                 {
-                    _status = timer.Status;
+                    _status = RecordingStatus.Cancelled;
                 }
 
                 var signal = _timerChanged;
@@ -122,7 +135,7 @@ internal static class ActiveRecordingInfoState
         {
             lock (_sync)
             {
-                if (!CanStartRecording(info, timer))
+                if (_status == RecordingStatus.InProgress || !CanStartRecording(info, timer))
                 {
                     return false;
                 }
