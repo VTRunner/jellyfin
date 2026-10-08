@@ -14,6 +14,7 @@ using Jellyfin.Data.Events;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Extensions;
 using Jellyfin.LiveTv.Configuration;
+using Jellyfin.LiveTv.Recordings;
 using Jellyfin.LiveTv.Timers;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Configuration;
@@ -36,6 +37,7 @@ namespace Jellyfin.LiveTv
         private readonly ITunerHostManager _tunerHostManager;
         private readonly IListingsManager _listingsManager;
         private readonly IRecordingsManager _recordingsManager;
+        private readonly IActiveRecordingUpdater _activeRecordingUpdater;
         private readonly ILibraryManager _libraryManager;
         private readonly LiveTvDtoService _tvDtoService;
         private readonly TimerManager _timerManager;
@@ -47,6 +49,7 @@ namespace Jellyfin.LiveTv
             ITunerHostManager tunerHostManager,
             IListingsManager listingsManager,
             IRecordingsManager recordingsManager,
+            IActiveRecordingUpdater activeRecordingUpdater,
             ILibraryManager libraryManager,
             LiveTvDtoService tvDtoService,
             TimerManager timerManager,
@@ -58,6 +61,7 @@ namespace Jellyfin.LiveTv
             _tunerHostManager = tunerHostManager;
             _listingsManager = listingsManager;
             _recordingsManager = recordingsManager;
+            _activeRecordingUpdater = activeRecordingUpdater;
             _tvDtoService = tvDtoService;
             _timerManager = timerManager;
             _seriesTimerManager = seriesTimerManager;
@@ -349,25 +353,19 @@ namespace Jellyfin.LiveTv
             }
 
             // Post-padding can be changed even while the recording is active.
-            existingTimer.PostPaddingSeconds = updatedTimer.PostPaddingSeconds;
+            existingTimer.PostPaddingSeconds = Math.Max(0, updatedTimer.PostPaddingSeconds);
             existingTimer.IsPostPaddingRequired = updatedTimer.IsPostPaddingRequired;
 
-            var activeRecordingPath = _recordingsManager.GetActiveRecordingPath(updatedTimer.Id);
-            if (activeRecordingPath is null)
+            if (_activeRecordingUpdater.TryUpdateTimer(existingTimer))
             {
-                // Only non-active recordings can have their pre-padding changed.
-                existingTimer.PrePaddingSeconds = updatedTimer.PrePaddingSeconds;
-                existingTimer.IsPrePaddingRequired = updatedTimer.IsPrePaddingRequired;
-                _timerManager.Update(existingTimer);
+                _timerManager.AddOrUpdate(existingTimer, false);
             }
             else
             {
-                _timerManager.AddOrUpdate(existingTimer, false);
-                var activeRecordingInfo = _recordingsManager.GetActiveRecordingInfo(activeRecordingPath);
-                if (activeRecordingInfo is not null)
-                {
-                    ActiveRecordingInfoState.UpdateTimer(activeRecordingInfo, existingTimer);
-                }
+                // Only non-active recordings can have their pre-padding changed.
+                existingTimer.PrePaddingSeconds = Math.Max(0, updatedTimer.PrePaddingSeconds);
+                existingTimer.IsPrePaddingRequired = updatedTimer.IsPrePaddingRequired;
+                _timerManager.Update(existingTimer);
             }
 
             return Task.CompletedTask;
