@@ -256,6 +256,8 @@ namespace Jellyfin.LiveTv
                 CopyProgramInfoToTimerInfo(programInfo, info);
             }
 
+            info.PrePaddingSeconds = Math.Max(0, info.PrePaddingSeconds);
+            info.PostPaddingSeconds = Math.Max(0, info.PostPaddingSeconds);
             info.IsManual = true;
             _timerManager.Add(info);
 
@@ -267,6 +269,8 @@ namespace Jellyfin.LiveTv
         public async Task<string> CreateSeriesTimer(SeriesTimerInfo info, CancellationToken cancellationToken)
         {
             info.Id = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+            info.PrePaddingSeconds = Math.Max(0, info.PrePaddingSeconds);
+            info.PostPaddingSeconds = Math.Max(0, info.PostPaddingSeconds);
 
             // populate info.seriesID
             var program = GetProgramInfoFromCache(info.ProgramId);
@@ -324,8 +328,8 @@ namespace Jellyfin.LiveTv
                 instance.EndDate = info.EndDate;
                 instance.IsPostPaddingRequired = info.IsPostPaddingRequired;
                 instance.IsPrePaddingRequired = info.IsPrePaddingRequired;
-                instance.PostPaddingSeconds = info.PostPaddingSeconds;
-                instance.PrePaddingSeconds = info.PrePaddingSeconds;
+                instance.PostPaddingSeconds = Math.Max(0, info.PostPaddingSeconds);
+                instance.PrePaddingSeconds = Math.Max(0, info.PrePaddingSeconds);
                 instance.Priority = info.Priority;
                 instance.RecordAnyChannel = info.RecordAnyChannel;
                 instance.RecordAnyTime = info.RecordAnyTime;
@@ -772,8 +776,8 @@ namespace Jellyfin.LiveTv
                         existingTimer.KeepUntil = seriesTimer.KeepUntil;
                         existingTimer.IsPostPaddingRequired = seriesTimer.IsPostPaddingRequired;
                         existingTimer.IsPrePaddingRequired = seriesTimer.IsPrePaddingRequired;
-                        existingTimer.PostPaddingSeconds = seriesTimer.PostPaddingSeconds;
-                        existingTimer.PrePaddingSeconds = seriesTimer.PrePaddingSeconds;
+                        existingTimer.PostPaddingSeconds = Math.Max(0, seriesTimer.PostPaddingSeconds);
+                        existingTimer.PrePaddingSeconds = Math.Max(0, seriesTimer.PrePaddingSeconds);
                         existingTimer.Priority = seriesTimer.Priority;
                         existingTimer.SeriesTimerId = seriesTimer.Id;
                     }
@@ -877,8 +881,8 @@ namespace Jellyfin.LiveTv
                 StartDate = parent.StartDate,
                 EndDate = parent.EndDate.Value,
                 ProgramId = parent.ExternalId,
-                PrePaddingSeconds = seriesTimer.PrePaddingSeconds,
-                PostPaddingSeconds = seriesTimer.PostPaddingSeconds,
+                PrePaddingSeconds = Math.Max(0, seriesTimer.PrePaddingSeconds),
+                PostPaddingSeconds = Math.Max(0, seriesTimer.PostPaddingSeconds),
                 IsPostPaddingRequired = seriesTimer.IsPostPaddingRequired,
                 IsPrePaddingRequired = seriesTimer.IsPrePaddingRequired,
                 KeepUntil = seriesTimer.KeepUntil,

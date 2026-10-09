@@ -63,16 +63,14 @@ internal sealed class ActiveRecording
                 _cancelledBeforeStart = true;
             }
 
-            var signal = _timerChanged;
-            _timerChanged = CreateTimerChangedSignal();
-            signal.TrySetResult();
-
+            SignalTimerChanged();
             return (previousEnd, ScheduledEnd);
         }
     }
 
     /// <summary>
-    /// Marks the recording as started, unless it was cancelled first or has already started.
+    /// Marks the recording as started, unless it was cancelled first or has already started. The timer is
+    /// applied, so anything waiting on the scheduled end is woken.
     /// </summary>
     /// <param name="timer">The current timer, which may have changed while the recording was starting.</param>
     /// <returns><c>true</c> if the caller should treat the recording as started.</returns>
@@ -89,6 +87,7 @@ internal sealed class ActiveRecording
             }
 
             SetTimer(timer);
+            SignalTimerChanged();
             _started = true;
             return true;
         }
@@ -116,6 +115,14 @@ internal sealed class ActiveRecording
     {
         Info.Timer = timer;
         _endDate = timer.EndDate;
-        _postPaddingSeconds = timer.PostPaddingSeconds;
+
+        _postPaddingSeconds = Math.Max(0, timer.PostPaddingSeconds);
+    }
+
+    private void SignalTimerChanged()
+    {
+        var signal = _timerChanged;
+        _timerChanged = CreateTimerChangedSignal();
+        signal.TrySetResult();
     }
 }

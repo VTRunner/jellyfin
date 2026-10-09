@@ -55,6 +55,7 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
 
     private readonly ConcurrentDictionary<string, ActiveRecording> _activeRecordings = new(StringComparer.OrdinalIgnoreCase);
     private readonly AsyncNonKeyedLocker _recordingDeleteSemaphore = new();
+    private readonly Lock _recordingPathLock = new();
     private bool _disposed;
 
     /// <summary>
@@ -318,6 +319,14 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
             return false;
         }
 
+        if (recording.Info.CancellationTokenSource.IsCancellationRequested)
+        {
+            _logger.LogInformation(
+                "Recording {TimerId} is already stopping, so the timer change does not affect it.",
+                timer.Id);
+            return true;
+        }
+
         var (previousEnd, newEnd) = recording.UpdateTimer(timer);
         if (previousEnd != newEnd)
         {
@@ -352,11 +361,12 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
             return;
         }
 
+        var endMonitorTask = MonitorRecordingEndAsync(recording);
+
         string recordingPath = string.Empty;
         string? seriesPath = null;
         string? liveStreamId = null;
         RecordingStatus recordingStatus = RecordingStatus.Error;
-        Task? endMonitorTask = null;
 
         try
         {
@@ -392,12 +402,11 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
             using var recorder = GetRecorder(mediaStreamInfo);
 
             recordingPath = recorder.GetOutputPath(mediaStreamInfo, recordingPath);
-            recordingPath = EnsureFileUnique(recordingPath, timer.Id);
 
             // Reserve the path so concurrent recordings don't pick the same file name, but don't
             // publish it through ActiveRecordingInfo.Path until the recorder has started and the
             // file exists. Until then Path stays empty, which callers still treat as "active".
-            recording.ReservedPath = recordingPath;
+            recordingPath = ReserveUniqueRecordingPath(recording, recordingPath, timer.Id);
 
             _libraryMonitor.ReportFileSystemChangeBeginning(recordingPath);
 
@@ -418,13 +427,27 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
                 var activeTimer = _timerManager.GetTimer(timer.Id) ?? timer;
                 if (!recording.TryMarkStarted(activeTimer))
                 {
+                    if (!recording.IsInProgress && !recordingInfo.CancellationTokenSource.IsCancellationRequested)
+                    {
+                        _logger.LogInformation("Timer {TimerId} was cancelled while its recording was starting. Stopping the recording.", timer.Id);
+                        _ = recordingInfo.CancellationTokenSource.CancelAsync();
+                    }
+
                     return;
                 }
 
                 recordingInfo.Path = recordingPath;
                 activeTimer.Status = RecordingStatus.InProgress;
-                _timerManager.AddOrUpdate(activeTimer, false);
-                endMonitorTask = MonitorRecordingEndAsync(recording);
+
+                try
+                {
+                    _timerManager.AddOrUpdate(activeTimer, false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error saving the in-progress status of timer {TimerId}. The recording continues.", activeTimer.Id);
+                }
+
                 _ = OnRecordingStartedAsync(activeTimer, recordingPath, seriesPath);
             }
 
@@ -450,30 +473,27 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
         }
         finally
         {
-            if (!string.IsNullOrWhiteSpace(liveStreamId))
-            {
-                try
-                {
-                    await _mediaSourceManager.CloseLiveStream(liveStreamId).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error closing live stream");
-                }
-            }
-
-            if (!recordingInfo.CancellationTokenSource.IsCancellationRequested)
-            {
-                await recordingInfo.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
-            }
-
-            if (endMonitorTask is not null)
-            {
-                await endMonitorTask.ConfigureAwait(false);
-            }
-
             try
             {
+                if (!string.IsNullOrWhiteSpace(liveStreamId))
+                {
+                    try
+                    {
+                        await _mediaSourceManager.CloseLiveStream(liveStreamId).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error closing live stream");
+                    }
+                }
+
+                if (!recordingInfo.CancellationTokenSource.IsCancellationRequested)
+                {
+                    await recordingInfo.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
+                }
+
+                await endMonitorTask.ConfigureAwait(false);
+
                 if (!string.IsNullOrWhiteSpace(recordingPath))
                 {
                     DeleteFileIfEmpty(recordingPath);
@@ -483,8 +503,9 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
             }
             finally
             {
-                // Remove before the retry/complete handling below. PostProcessRecording waits for
-                // the user's post-processor, and the recording must not appear active meanwhile.
+                // Always unregister, or this timer could not be recorded again until a restart. This
+                // happens before the retry/complete handling below because PostProcessRecording waits
+                // for the user's post-processor, and the recording must not appear active meanwhile.
                 _activeRecordings.TryRemove(timer.Id, out _);
             }
 
@@ -916,6 +937,18 @@ public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpda
         }
 
         _timerManager.Delete(timer);
+    }
+
+    private string ReserveUniqueRecordingPath(ActiveRecording recording, string path, string timerId)
+    {
+        // Choosing and reserving the path in one locked step keeps two recordings that start
+        // together from picking the same file.
+        lock (_recordingPathLock)
+        {
+            var uniquePath = EnsureFileUnique(path, timerId);
+            recording.ReservedPath = uniquePath;
+            return uniquePath;
+        }
     }
 
     private string EnsureFileUnique(string path, string timerId)
