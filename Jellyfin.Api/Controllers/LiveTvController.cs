@@ -482,6 +482,8 @@ public class LiveTvController : BaseJellyfinApiController
     /// <param name="seriesTimerId">Optional. Filter by timers belonging to a series timer.</param>
     /// <param name="isActive">Optional. Filter by timers that are active.</param>
     /// <param name="isScheduled">Optional. Filter by timers that are scheduled.</param>
+    /// <param name="sortBy">Optional. Sort by Priority.</param>
+    /// <param name="sortOrder">Optional. Sort in Ascending or Descending order.</param>
     /// <returns>
     /// A <see cref="Task"/> containing an <see cref="OkResult"/> which contains the live tv timers.
     /// </returns>
@@ -492,7 +494,9 @@ public class LiveTvController : BaseJellyfinApiController
         [FromQuery] string? channelId,
         [FromQuery] string? seriesTimerId,
         [FromQuery] bool? isActive,
-        [FromQuery] bool? isScheduled)
+        [FromQuery] bool? isScheduled,
+        [FromQuery] string? sortBy,
+        [FromQuery] SortOrder? sortOrder)
     {
         return await _liveTvManager.GetTimers(
             new TimerQuery
@@ -500,9 +504,24 @@ public class LiveTvController : BaseJellyfinApiController
                 ChannelId = channelId,
                 SeriesTimerId = seriesTimerId,
                 IsActive = isActive,
-                IsScheduled = isScheduled
+                IsScheduled = isScheduled,
+                SortBy = sortBy,
+                SortOrder = sortOrder?.ToString() ?? SortOrder.Ascending.ToString()
             },
             CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gets the server-side forecast for scheduled recordings based on tuner availability and recording priority.
+    /// </summary>
+    /// <response code="200">Recording forecast returned.</response>
+    /// <returns>A <see cref="Task{TResult}"/> containing the recording forecast.</returns>
+    [HttpGet("RecordingSchedule")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [Authorize(Policy = Policies.LiveTvAccess)]
+    public async Task<ActionResult<IReadOnlyList<RecordingScheduleForecastDto>>> GetRecordingScheduleForecast()
+    {
+        return Ok(await _liveTvManager.GetRecordingScheduleForecast(CancellationToken.None).ConfigureAwait(false));
     }
 
     /// <summary>
@@ -823,6 +842,78 @@ public class LiveTvController : BaseJellyfinApiController
     public async Task<ActionResult> UpdateTimer([FromRoute, Required] string timerId, [FromBody] TimerInfoDto timerInfo)
     {
         await _liveTvManager.UpdateTimer(timerInfo, CancellationToken.None).ConfigureAwait(false);
+        return NoContent();
+    }
+
+    /// <summary>
+    /// Moves a live tv timer up in the recording priority list.
+    /// </summary>
+    /// <param name="timerId">Timer id.</param>
+    /// <response code="204">Timer priority changed.</response>
+    /// <returns>A <see cref="NoContentResult"/>.</returns>
+    [HttpPost("Timers/{timerId}/Priority/Up")]
+    [Authorize(Policy = Policies.LiveTvManagement)]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    public async Task<ActionResult> MoveTimerPriorityUp([FromRoute, Required] string timerId)
+    {
+        await _liveTvManager.MoveTimerPriority(timerId, true, CancellationToken.None).ConfigureAwait(false);
+        return NoContent();
+    }
+
+    /// <summary>
+    /// Moves a live tv timer down in the recording priority list.
+    /// </summary>
+    /// <param name="timerId">Timer id.</param>
+    /// <response code="204">Timer priority changed.</response>
+    /// <returns>A <see cref="NoContentResult"/>.</returns>
+    [HttpPost("Timers/{timerId}/Priority/Down")]
+    [Authorize(Policy = Policies.LiveTvManagement)]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    public async Task<ActionResult> MoveTimerPriorityDown([FromRoute, Required] string timerId)
+    {
+        await _liveTvManager.MoveTimerPriority(timerId, false, CancellationToken.None).ConfigureAwait(false);
+        return NoContent();
+    }
+
+    /// <summary>
+    /// Moves a recording or series timer up in the unified recording priority list.
+    /// </summary>
+    /// <param name="entryType">Entry type. Use Timer or Series.</param>
+    /// <param name="entryId">Internal timer or series timer id.</param>
+    /// <response code="204">Priority changed.</response>
+    [HttpPost("RecordingPriority/{entryType}/{entryId}/Up")]
+    [Authorize(Policy = Policies.LiveTvManagement)]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    public async Task<ActionResult> MoveRecordingPriorityUp(
+        [FromRoute, Required] string entryType,
+        [FromRoute, Required] string entryId)
+    {
+        await _liveTvManager.MoveRecordingPriority(
+            entryId,
+            string.Equals(entryType, "Series", StringComparison.OrdinalIgnoreCase),
+            true,
+            CancellationToken.None).ConfigureAwait(false);
+        return NoContent();
+    }
+
+    /// <summary>
+    /// Moves a recording or series timer down in the unified recording priority list.
+    /// </summary>
+    /// <param name="entryType">Entry type. Use Timer or Series.</param>
+    /// <param name="entryId">Internal timer or series timer id.</param>
+    /// <response code="204">Priority changed.</response>
+    [HttpPost("RecordingPriority/{entryType}/{entryId}/Down")]
+    [Authorize(Policy = Policies.LiveTvManagement)]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    public async Task<ActionResult> MoveRecordingPriorityDown(
+        [FromRoute, Required] string entryType,
+        [FromRoute, Required] string entryId)
+    {
+        await _liveTvManager.MoveRecordingPriority(
+            entryId,
+            string.Equals(entryType, "Series", StringComparison.OrdinalIgnoreCase),
+            false,
+            CancellationToken.None).ConfigureAwait(false);
         return NoContent();
     }
 

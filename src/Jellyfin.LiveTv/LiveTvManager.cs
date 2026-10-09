@@ -8,6 +8,7 @@ using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using AsyncKeyedLock;
 using Jellyfin.Data;
 using Jellyfin.Data.Enums;
 using Jellyfin.Data.Events;
@@ -46,6 +47,7 @@ namespace Jellyfin.LiveTv
         private readonly IChannelManager _channelManager;
         private readonly IRecordingsManager _recordingsManager;
         private readonly LiveTvDtoService _tvDtoService;
+        private readonly RecordingScheduleForecastEngine _recordingScheduleForecastEngine;
         private readonly ILiveTvService[] _services;
 
         public LiveTvManager(
@@ -72,6 +74,7 @@ namespace Jellyfin.LiveTv
             _tvDtoService = liveTvDtoService;
             _recordingsManager = recordingsManager;
             _services = services.ToArray();
+            _recordingScheduleForecastEngine = new RecordingScheduleForecastEngine(_config);
 
             var defaultService = _services.OfType<DefaultLiveTvService>().First();
             defaultService.TimerCreated += OnEmbyTvTimerCreated;
@@ -803,11 +806,72 @@ namespace Jellyfin.LiveTv
                 returnList.Add(_tvDtoService.GetTimerInfoDto(i.Item1, i.Item2, program, channel));
             }
 
-            var returnArray = returnList
-                .OrderBy(i => i.StartDate)
-                .ToArray();
+            var returnArray = string.Equals(query.SortBy, "Priority", StringComparison.OrdinalIgnoreCase)
+                ? (string.Equals(query.SortOrder, SortOrder.Descending.ToString(), StringComparison.OrdinalIgnoreCase)
+                    ? returnList.OrderBy(i => i.Priority).ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
+                    : returnList.OrderByDescending(i => i.Priority).ThenByDescending(i => i.Name, StringComparer.OrdinalIgnoreCase))
+                    .ThenBy(i => i.Id, StringComparer.OrdinalIgnoreCase)
+                    .ToArray()
+                : returnList.OrderBy(i => i.StartDate).ToArray();
 
             return new QueryResult<TimerInfoDto>(returnArray);
+        }
+
+        public async Task<IReadOnlyList<RecordingScheduleForecastDto>> GetRecordingScheduleForecast(CancellationToken cancellationToken)
+        {
+            var activeTunerHosts = _recordingsManager.GetActiveRecordings()
+                .Where(i => !string.IsNullOrWhiteSpace(i.TunerHostId))
+                .ToDictionary(i => i.Id, i => i.TunerHostId, StringComparer.OrdinalIgnoreCase);
+
+            var tasks = _services.Select(async service =>
+            {
+                try
+                {
+                    var timers = await service.GetTimersAsync(cancellationToken).ConfigureAwait(false);
+                    return timers
+                        .Where(timer => timer.Status is RecordingStatus.New or RecordingStatus.InProgress)
+                        .Select(timer => new RecordingScheduleForecastEngine.ForecastTimerInput
+                        {
+                            Id = _tvDtoService.GetInternalTimerId(timer.Id),
+                            Name = timer.Name,
+                            ChannelId = timer.ChannelId,
+                            ChannelNumber = GetForecastChannelNumber(service, timer.ChannelId),
+                            SeriesTimerId = timer.SeriesTimerId,
+                            TunerHostId = timer.Status == RecordingStatus.InProgress
+                                && activeTunerHosts.TryGetValue(_tvDtoService.GetInternalTimerId(timer.Id), out var tunerHostId)
+                                ? tunerHostId
+                                : null,
+                            StartDate = timer.StartDate,
+                            EndDate = timer.EndDate,
+                            Priority = timer.Priority,
+                            PrePaddingSeconds = Math.Max(timer.PrePaddingSeconds, 0),
+                            PostPaddingSeconds = Math.Max(timer.PostPaddingSeconds, 0),
+                            IsPostPaddingRequired = timer.IsPostPaddingRequired,
+                            Status = timer.Status,
+                            Service = service
+                        });
+                }
+                catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                {
+                    return Enumerable.Empty<RecordingScheduleForecastEngine.ForecastTimerInput>();
+                }
+            });
+
+            var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+            return await _recordingScheduleForecastEngine
+                .ForecastAsync(results.SelectMany(i => i).ToArray(), DateTime.UtcNow, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        private string GetForecastChannelNumber(ILiveTvService service, string channelId)
+        {
+            if (string.IsNullOrWhiteSpace(channelId))
+            {
+                return null;
+            }
+
+            var internalChannelId = _tvDtoService.GetInternalChannelId(service.Name, channelId);
+            return (_libraryManager.GetItemById(internalChannelId) as LiveTvChannel)?.Number;
         }
 
         public async Task CancelTimer(string id)
@@ -862,6 +926,194 @@ namespace Jellyfin.LiveTv
             var results = await GetSeriesTimers(new SeriesTimerQuery(), cancellationToken).ConfigureAwait(false);
 
             return results.Items.FirstOrDefault(i => string.Equals(i.Id, id, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public async Task MoveTimerPriority(string timerId, bool moveUp, CancellationToken cancellationToken)
+        {
+            var timer = await GetTimer(timerId, cancellationToken).ConfigureAwait(false);
+            if (timer is null)
+            {
+                throw new ResourceNotFoundException();
+            }
+
+            if (!string.IsNullOrWhiteSpace(timer.SeriesTimerId))
+            {
+                // TimerInfoDto.SeriesTimerId is already the internal series-timer id.
+                // Do not hash it again; doing so produces an id that can never match
+                // the series entry in the unified priority list.
+                await MoveRecordingPriority(timer.SeriesTimerId, true, moveUp, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            await MoveRecordingPriority(timerId, false, moveUp, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task MoveRecordingPriority(string id, bool isSeries, bool moveUp, CancellationToken cancellationToken)
+        {
+            using (await RecordingPriorityLock.Instance.LockAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var entries = new List<RecordingPriorityEntry>();
+
+                foreach (var service in _services)
+                {
+                    var seriesTimers = await service.GetSeriesTimersAsync(cancellationToken).ConfigureAwait(false);
+                    entries.AddRange(seriesTimers.Select(seriesTimer => new RecordingPriorityEntry(
+                        true,
+                        _tvDtoService.GetInternalSeriesTimerId(seriesTimer.Id).ToString("N", CultureInfo.InvariantCulture),
+                        seriesTimer.Id,
+                        seriesTimer.Priority,
+                        seriesTimer.StartDate,
+                        seriesTimer.Name,
+                        service,
+                        seriesTimer,
+                        null)));
+
+                    var timers = await service.GetTimersAsync(cancellationToken).ConfigureAwait(false);
+                    entries.AddRange(timers
+                        .Where(timer => timer.Status is RecordingStatus.New or RecordingStatus.InProgress)
+                        .Where(timer => string.IsNullOrWhiteSpace(timer.SeriesTimerId))
+                        .Select(timer => new RecordingPriorityEntry(
+                            false,
+                            _tvDtoService.GetInternalTimerId(timer.Id),
+                            timer.Id,
+                            timer.Priority,
+                            timer.StartDate,
+                            timer.Name,
+                            service,
+                            null,
+                            timer)));
+                }
+
+                var ordered = entries
+                    .OrderBy(entry => entry.Priority)
+                    .ThenBy(entry => entry.StartDate)
+                    .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(entry => entry.Id, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var currentIndex = ordered.FindIndex(entry =>
+                    entry.IsSeries == isSeries
+                    && string.Equals(entry.Id, id, StringComparison.OrdinalIgnoreCase));
+
+                if (currentIndex < 0)
+                {
+                    throw new ResourceNotFoundException();
+                }
+
+                var newIndex = moveUp ? currentIndex - 1 : currentIndex + 1;
+                if (newIndex < 0 || newIndex >= ordered.Count)
+                {
+                    return;
+                }
+
+                // Older installations may have duplicate/default priorities. Normalize only
+                // when needed so a move always corresponds to exactly one visible position.
+                var prioritiesAreNormalized = true;
+                for (var index = 0; index < ordered.Count; index++)
+                {
+                    if (ordered[index].Priority != index)
+                    {
+                        prioritiesAreNormalized = false;
+                        break;
+                    }
+                }
+
+                if (!prioritiesAreNormalized)
+                {
+                    for (var index = 0; index < ordered.Count; index++)
+                    {
+                        ordered[index].Priority = index;
+                    }
+
+                    foreach (var entry in ordered)
+                    {
+                        await UpdateRecordingPriorityAsync(entry, cancellationToken).ConfigureAwait(false);
+                    }
+                }
+
+                var current = ordered[currentIndex];
+                var adjacent = ordered[newIndex];
+                var currentPriority = current.Priority;
+                var adjacentPriority = adjacent.Priority;
+                current.Priority = adjacentPriority;
+                adjacent.Priority = currentPriority;
+
+                // Persist the entry moving to the lower priority first. This keeps the
+                // externally visible order coherent while the two records are being saved.
+                if (currentPriority < adjacentPriority)
+                {
+                    await UpdateRecordingPriorityAsync(adjacent, cancellationToken).ConfigureAwait(false);
+                    await UpdateRecordingPriorityAsync(current, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await UpdateRecordingPriorityAsync(current, cancellationToken).ConfigureAwait(false);
+                    await UpdateRecordingPriorityAsync(adjacent, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private async Task UpdateRecordingPriorityAsync(RecordingPriorityEntry entry, CancellationToken cancellationToken)
+        {
+            if (entry.Service is DefaultLiveTvService defaultLiveTvService)
+            {
+                if (entry.IsSeries)
+                {
+                    await defaultLiveTvService.UpdateSeriesTimerPriorityAsync(entry.ExternalId, entry.Priority, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await defaultLiveTvService.UpdateTimerPriorityAsync(entry.ExternalId, entry.Priority, cancellationToken).ConfigureAwait(false);
+                }
+
+                return;
+            }
+
+            if (entry.IsSeries)
+            {
+                entry.SeriesTimer.Priority = entry.Priority;
+                await entry.Service.UpdateSeriesTimerAsync(entry.SeriesTimer, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                entry.Timer.Priority = entry.Priority;
+                await entry.Service.UpdateTimerAsync(entry.Timer, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        private sealed class RecordingPriorityEntry
+        {
+            public RecordingPriorityEntry(
+                bool isSeries,
+                string id,
+                string externalId,
+                int priority,
+                DateTime startDate,
+                string name,
+                ILiveTvService service,
+                SeriesTimerInfo seriesTimer,
+                TimerInfo timer)
+            {
+                IsSeries = isSeries;
+                Id = id;
+                ExternalId = externalId;
+                Priority = priority;
+                StartDate = startDate;
+                Name = name;
+                Service = service;
+                SeriesTimer = seriesTimer;
+                Timer = timer;
+            }
+
+            public bool IsSeries { get; }
+            public string Id { get; }
+            public string ExternalId { get; }
+            public int Priority { get; set; }
+            public DateTime StartDate { get; }
+            public string Name { get; }
+            public ILiveTvService Service { get; }
+            public SeriesTimerInfo SeriesTimer { get; }
+            public TimerInfo Timer { get; }
         }
 
         private async Task<QueryResult<SeriesTimerInfo>> GetSeriesTimersInternal(SeriesTimerQuery query, CancellationToken cancellationToken)
@@ -1109,65 +1361,94 @@ namespace Jellyfin.LiveTv
             return info;
         }
 
+        private async Task<int> GetNextRecordingPriorityAsync(CancellationToken cancellationToken)
+        {
+            var maxPriority = -1;
+
+            foreach (var service in _services)
+            {
+                var seriesTimers = await service.GetSeriesTimersAsync(cancellationToken).ConfigureAwait(false);
+                var seriesMaxPriority = seriesTimers
+                    .Select(i => i.Priority)
+                    .DefaultIfEmpty(-1)
+                    .Max();
+                maxPriority = Math.Max(maxPriority, seriesMaxPriority);
+
+                var timers = await service.GetTimersAsync(cancellationToken).ConfigureAwait(false);
+                var timerMaxPriority = timers
+                    .Where(i => i.Status is RecordingStatus.New or RecordingStatus.InProgress)
+                    .Select(i => i.Priority)
+                    .DefaultIfEmpty(-1)
+                    .Max();
+                maxPriority = Math.Max(maxPriority, timerMaxPriority);
+            }
+
+            return maxPriority == int.MaxValue ? int.MaxValue : maxPriority + 1;
+        }
+
         public async Task CreateTimer(TimerInfoDto timer, CancellationToken cancellationToken)
         {
-            var service = GetService(timer.ServiceName);
-
-            var info = await _tvDtoService.GetTimerInfo(timer, true, this, cancellationToken).ConfigureAwait(false);
-
-            // Set priority from default values
-            var defaultValues = await service.GetNewTimerDefaultsAsync(cancellationToken).ConfigureAwait(false);
-            info.Priority = defaultValues.Priority;
-
-            string newTimerId = null;
-            if (service is ISupportsNewTimerIds supportsNewTimerIds)
+            using (await RecordingPriorityLock.Instance.LockAsync(cancellationToken).ConfigureAwait(false))
             {
-                newTimerId = await supportsNewTimerIds.CreateTimer(info, cancellationToken).ConfigureAwait(false);
-                newTimerId = _tvDtoService.GetInternalTimerId(newTimerId);
-            }
-            else
-            {
-                await service.CreateTimerAsync(info, cancellationToken).ConfigureAwait(false);
-            }
+                var service = GetService(timer.ServiceName);
 
-            _logger.LogInformation("New recording scheduled");
+                var info = await _tvDtoService.GetTimerInfo(timer, true, this, cancellationToken).ConfigureAwait(false);
 
-            if (service is not DefaultLiveTvService)
-            {
-                TimerCreated?.Invoke(this, new GenericEventArgs<TimerEventInfo>(
-                    new TimerEventInfo(newTimerId)
-                    {
-                        ProgramId = _tvDtoService.GetInternalProgramId(info.ProgramId)
-                    }));
+                // New recordings are appended to the bottom of the unified recording priority list.
+                info.Priority = await GetNextRecordingPriorityAsync(cancellationToken).ConfigureAwait(false);
+
+                string newTimerId = null;
+                if (service is ISupportsNewTimerIds supportsNewTimerIds)
+                {
+                    newTimerId = await supportsNewTimerIds.CreateTimer(info, cancellationToken).ConfigureAwait(false);
+                    newTimerId = _tvDtoService.GetInternalTimerId(newTimerId);
+                }
+                else
+                {
+                    await service.CreateTimerAsync(info, cancellationToken).ConfigureAwait(false);
+                }
+
+                _logger.LogInformation("New recording scheduled");
+
+                if (service is not DefaultLiveTvService)
+                {
+                    TimerCreated?.Invoke(this, new GenericEventArgs<TimerEventInfo>(
+                        new TimerEventInfo(newTimerId)
+                        {
+                            ProgramId = _tvDtoService.GetInternalProgramId(info.ProgramId)
+                        }));
+                }
             }
         }
 
         public async Task CreateSeriesTimer(SeriesTimerInfoDto timer, CancellationToken cancellationToken)
         {
-            var service = GetService(timer.ServiceName);
-
-            var info = await _tvDtoService.GetSeriesTimerInfo(timer, true, this, cancellationToken).ConfigureAwait(false);
-
-            // Set priority from default values
-            var defaultValues = await service.GetNewTimerDefaultsAsync(cancellationToken).ConfigureAwait(false);
-            info.Priority = defaultValues.Priority;
-
-            string newTimerId = null;
-            if (service is ISupportsNewTimerIds supportsNewTimerIds)
+            using (await RecordingPriorityLock.Instance.LockAsync(cancellationToken).ConfigureAwait(false))
             {
-                newTimerId = await supportsNewTimerIds.CreateSeriesTimer(info, cancellationToken).ConfigureAwait(false);
-                newTimerId = _tvDtoService.GetInternalSeriesTimerId(newTimerId).ToString("N", CultureInfo.InvariantCulture);
-            }
-            else
-            {
-                await service.CreateSeriesTimerAsync(info, cancellationToken).ConfigureAwait(false);
-            }
+                var service = GetService(timer.ServiceName);
 
-            SeriesTimerCreated?.Invoke(this, new GenericEventArgs<TimerEventInfo>(
-                new TimerEventInfo(newTimerId)
+                var info = await _tvDtoService.GetSeriesTimerInfo(timer, true, this, cancellationToken).ConfigureAwait(false);
+
+                // New series recordings are appended to the bottom of the unified recording priority list.
+                info.Priority = await GetNextRecordingPriorityAsync(cancellationToken).ConfigureAwait(false);
+
+                string newTimerId = null;
+                if (service is ISupportsNewTimerIds supportsNewTimerIds)
                 {
-                    ProgramId = _tvDtoService.GetInternalProgramId(info.ProgramId)
-                }));
+                    newTimerId = await supportsNewTimerIds.CreateSeriesTimer(info, cancellationToken).ConfigureAwait(false);
+                    newTimerId = _tvDtoService.GetInternalSeriesTimerId(newTimerId).ToString("N", CultureInfo.InvariantCulture);
+                }
+                else
+                {
+                    await service.CreateSeriesTimerAsync(info, cancellationToken).ConfigureAwait(false);
+                }
+
+                SeriesTimerCreated?.Invoke(this, new GenericEventArgs<TimerEventInfo>(
+                    new TimerEventInfo(newTimerId)
+                    {
+                        ProgramId = _tvDtoService.GetInternalProgramId(info.ProgramId)
+                    }));
+            }
         }
 
         public async Task UpdateTimer(TimerInfoDto timer, CancellationToken cancellationToken)

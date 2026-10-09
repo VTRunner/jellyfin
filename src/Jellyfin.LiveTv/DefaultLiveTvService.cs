@@ -15,6 +15,8 @@ using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Extensions;
 using Jellyfin.LiveTv.Configuration;
 using Jellyfin.LiveTv.Timers;
+using Jellyfin.LiveTv.TunerHosts;
+using Jellyfin.LiveTv.TunerHosts.HdHomerun;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Dto;
@@ -144,6 +146,89 @@ namespace Jellyfin.LiveTv
             return GetChannelsAsync(false, cancellationToken);
         }
 
+        /// <summary>
+        /// Gets tuner channels for the recording schedule forecast, preferring cached tuner data.
+        /// </summary>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The available tuner channels.</returns>
+        internal async Task<IEnumerable<ChannelInfo>> GetChannelsForRecordingForecastAsync(CancellationToken cancellationToken)
+        {
+            // Build the forecast channel list per configured tuner host instead of using
+            // the aggregated ITunerHost.GetChannels result. The aggregated method
+            // intentionally de-duplicates channels across hosts, which would hide the
+            // fact that the same channel may be available from multiple tuner hosts.
+            var configuredHosts = _config.GetLiveTvConfiguration().TunerHosts;
+            var channels = new List<ChannelInfo>();
+
+            foreach (var hostInstance in _tunerHostManager.TunerHosts)
+            {
+                var hosts = configuredHosts
+                    .Where(i => string.Equals(i.Type, hostInstance.Type, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+
+                if (hostInstance is BaseTunerHost baseTunerHost)
+                {
+                    foreach (var host in hosts)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        try
+                        {
+                            if (hostInstance is HdHomerunHost hdHomerunHost && host.TunerCount <= 0)
+                            {
+                                // HDHomeRun uses zero in configuration to mean that no
+                                // explicit limit was configured. Reuse the last successful
+                                // discovery when possible so the Schedule page does not
+                                // perform a device discovery on every forecast request.
+                                var cachedTunerCount = await RecordingScheduleForecastCache
+                                    .GetTunerCountAsync(_config.ApplicationPaths.CachePath, host.Id, cancellationToken)
+                                    .ConfigureAwait(false);
+                                if (cachedTunerCount > 0)
+                                {
+                                    host.TunerCount = cachedTunerCount;
+                                }
+                                else
+                                {
+                                    var discoveredHost = await hdHomerunHost.TryGetTunerHostInfo(host.Url, cancellationToken).ConfigureAwait(false);
+                                    if (discoveredHost.TunerCount > 0)
+                                    {
+                                        host.TunerCount = discoveredHost.TunerCount;
+                                        await RecordingScheduleForecastCache
+                                            .SaveTunerCountAsync(_config.ApplicationPaths.CachePath, host.Id, host.TunerCount, cancellationToken)
+                                            .ConfigureAwait(false);
+                                    }
+                                }
+                            }
+
+                            var tunerChannels = await baseTunerHost.GetChannelsForRecordingForecast(host, cancellationToken).ConfigureAwait(false);
+                            foreach (var channel in tunerChannels)
+                            {
+                                // The configured host being queried is authoritative. This also
+                                // repairs older disk-cache entries that predate TunerHostId.
+                                channel.TunerHostId = host.Id;
+                                channels.Add(channel);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error getting forecast channels for tuner host {TunerHostId}", host.Id);
+                        }
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        channels.AddRange(await hostInstance.GetChannels(true, cancellationToken).ConfigureAwait(false));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error getting forecast channels from tuner host type {TunerHostType}", hostInstance.Type);
+                    }
+                }
+            }
+
+            return channels;
+        }
         public Task CancelSeriesTimerAsync(string timerId, CancellationToken cancellationToken)
         {
             var timers = _timerManager
@@ -334,6 +419,7 @@ namespace Jellyfin.LiveTv
                 _seriesTimerManager.Update(instance);
 
                 UpdateTimersForSeriesTimer(instance, true, true);
+                UpdateActiveTimersForSeriesPriority(instance);
             }
 
             return Task.CompletedTask;
@@ -348,18 +434,107 @@ namespace Jellyfin.LiveTv
                 throw new ResourceNotFoundException();
             }
 
-            // Only update if not currently active
+            // Post-padding can be changed even while the recording is active.
+            existingTimer.PostPaddingSeconds = Math.Max(updatedTimer.PostPaddingSeconds, 0);
+            existingTimer.IsPostPaddingRequired = updatedTimer.IsPostPaddingRequired;
+
+            // Series timer priority is authoritative for every child timer. One-off timers
+            // retain their individual priority.
+            if (string.IsNullOrWhiteSpace(existingTimer.SeriesTimerId))
+            {
+                existingTimer.Priority = updatedTimer.Priority;
+            }
+            else
+            {
+                var seriesTimer = _seriesTimerManager.GetAll()
+                    .FirstOrDefault(i => string.Equals(i.Id, existingTimer.SeriesTimerId, StringComparison.OrdinalIgnoreCase));
+                if (seriesTimer is not null)
+                {
+                    existingTimer.Priority = seriesTimer.Priority;
+                }
+            }
+
             if (_recordingsManager.GetActiveRecordingPath(updatedTimer.Id) is null)
             {
+                // Only non-active recordings can have their pre-padding changed.
                 existingTimer.PrePaddingSeconds = updatedTimer.PrePaddingSeconds;
-                existingTimer.PostPaddingSeconds = updatedTimer.PostPaddingSeconds;
-                existingTimer.IsPostPaddingRequired = updatedTimer.IsPostPaddingRequired;
                 existingTimer.IsPrePaddingRequired = updatedTimer.IsPrePaddingRequired;
-
                 _timerManager.Update(existingTimer);
+            }
+            else
+            {
+                // Persist the active timer without restarting the start timer, then notify
+                // the active recording so its dynamic end-time waiter recalculates.
+                _timerManager.AddOrUpdate(existingTimer, false);
+                _recordingsManager.UpdateActiveRecordingTimer(existingTimer);
             }
 
             return Task.CompletedTask;
+        }
+
+        public Task UpdateTimerPriorityAsync(string timerId, int priority, CancellationToken cancellationToken)
+        {
+            var instance = _timerManager.GetTimer(timerId);
+            if (instance is null)
+            {
+                throw new ResourceNotFoundException();
+            }
+
+            instance.Priority = priority;
+
+            if (_recordingsManager.GetActiveRecordingPath(timerId) is null)
+            {
+                _timerManager.Update(instance);
+            }
+            else
+            {
+                // Preserve the active timer's running state while persisting the new priority.
+                _timerManager.AddOrUpdate(instance, false);
+                _recordingsManager.UpdateActiveRecordingTimer(instance);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public Task UpdateSeriesTimerPriorityAsync(string seriesTimerId, int priority, CancellationToken cancellationToken)
+        {
+            var instance = _seriesTimerManager.GetAll()
+                .FirstOrDefault(i => string.Equals(i.Id, seriesTimerId, StringComparison.OrdinalIgnoreCase));
+
+            if (instance is null)
+            {
+                throw new ResourceNotFoundException();
+            }
+
+            instance.Priority = priority;
+            _seriesTimerManager.Update(instance);
+            UpdateTimersForSeriesPriority(instance);
+
+            return Task.CompletedTask;
+        }
+
+        public Task UpdateSeriesTimerPriorityAsync(SeriesTimerInfo info, CancellationToken cancellationToken)
+            => UpdateSeriesTimerPriorityAsync(info.Id, info.Priority, cancellationToken);
+
+        private void UpdateTimersForSeriesPriority(SeriesTimerInfo seriesTimer)
+        {
+            foreach (var timer in _timerManager.GetAll()
+                .Where(i => string.Equals(i.SeriesTimerId, seriesTimer.Id, StringComparison.OrdinalIgnoreCase))
+                .Where(i => i.Status is RecordingStatus.New or RecordingStatus.InProgress))
+            {
+                timer.Priority = seriesTimer.Priority;
+                _timerManager.AddOrUpdate(timer, false);
+
+                if (_recordingsManager.GetActiveRecordingPath(timer.Id) is not null)
+                {
+                    _recordingsManager.UpdateActiveRecordingTimer(timer);
+                }
+            }
+        }
+
+        private void UpdateActiveTimersForSeriesPriority(SeriesTimerInfo seriesTimer)
+        {
+            UpdateTimersForSeriesPriority(seriesTimer);
         }
 
         private static void UpdateExistingTimerWithNewMetadata(TimerInfo existingTimer, TimerInfo updatedTimer)
@@ -556,9 +731,10 @@ namespace Jellyfin.LiveTv
                 var activeRecordingInfo = new ActiveRecordingInfo
                 {
                     CancellationTokenSource = new CancellationTokenSource(),
-                    Timer = timer,
                     Id = timer.Id
                 };
+
+                activeRecordingInfo.UpdateTimer(timer);
 
                 if (_recordingsManager.GetActiveRecordingPath(timer.Id) is not null)
                 {
@@ -583,7 +759,7 @@ namespace Jellyfin.LiveTv
                     CopyProgramInfoToTimerInfo(programInfo, timer);
                 }
 
-                await _recordingsManager.RecordStream(activeRecordingInfo, GetLiveTvChannel(timer), recordingEndDate)
+                await _recordingsManager.RecordStream(activeRecordingInfo, GetLiveTvChannel(timer))
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)

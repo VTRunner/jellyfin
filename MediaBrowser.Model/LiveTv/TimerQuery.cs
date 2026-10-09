@@ -22,5 +22,17 @@ namespace MediaBrowser.Model.LiveTv
         public bool? IsActive { get; set; }
 
         public bool? IsScheduled { get; set; }
+
+        /// <summary>
+        /// Gets or sets the sort by - Priority.
+        /// </summary>
+        /// <value>The sort by.</value>
+        public string SortBy { get; set; }
+
+        /// <summary>
+        /// Gets or sets the sort order.
+        /// </summary>
+        /// <value>The sort order.</value>
+        public string SortOrder { get; set; }
     }
 }

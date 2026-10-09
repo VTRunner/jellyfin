@@ -74,6 +74,66 @@ namespace Jellyfin.LiveTv.TunerHosts
                 .ToList();
         }
 
+        /// <summary>
+        /// Gets channels for recording forecasting, falling back to the per-tuner disk cache
+        /// when the live tuner channel query fails.
+        /// </summary>
+        /// <param name="tuner">The configured tuner host.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The cached or live tuner channels.</returns>
+        public async Task<List<ChannelInfo>> GetChannelsForRecordingForecast(TunerHostInfo tuner, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(tuner.Id))
+            {
+                return [];
+            }
+
+            // Forecasting is a read-only calculation. Prefer the existing per-tuner
+            // channel cache so a Schedule refresh does not force a network channel scan.
+            // The normal Live TV channel refresh continues to update this cache.
+            var channelCacheFile = Path.Combine(Config.ApplicationPaths.CachePath, tuner.Id + "_channels");
+            try
+            {
+                var readStream = AsyncFile.OpenRead(channelCacheFile);
+                await using (readStream.ConfigureAwait(false))
+                {
+                    var cachedChannels = await JsonSerializer.DeserializeAsync<List<ChannelInfo>>(readStream, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    if (cachedChannels is { Count: > 0 })
+                    {
+                        return cachedChannels;
+                    }
+                }
+            }
+            catch (FileNotFoundException)
+            {
+                // Fall through to a live query when no cache exists yet.
+            }
+            catch (IOException ex)
+            {
+                Logger.LogDebug(ex, "Error reading channel cache for recording forecast for tuner host {TunerHostId}; trying live data", tuner.Id);
+            }
+            catch (JsonException ex)
+            {
+                Logger.LogDebug(ex, "Error deserializing channel cache for recording forecast for tuner host {TunerHostId}; trying live data", tuner.Id);
+            }
+
+            try
+            {
+                var channels = await GetChannels(tuner, true, cancellationToken).ConfigureAwait(false);
+                if (channels.Count > 0)
+                {
+                    return channels;
+                }
+
+                Logger.LogDebug("No live channels returned for recording forecast for tuner host {TunerHostId}", tuner.Id);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Error getting live channels for recording forecast for tuner host {TunerHostId}", tuner.Id);
+            }
+
+            return [];
+        }
         public async Task<List<ChannelInfo>> GetChannels(bool enableCache, CancellationToken cancellationToken)
         {
             var list = new List<ChannelInfo>();

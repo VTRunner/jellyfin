@@ -97,6 +97,13 @@ namespace MediaBrowser.Controller.LiveTv
         Task<QueryResult<TimerInfoDto>> GetTimers(TimerQuery query, CancellationToken cancellationToken);
 
         /// <summary>
+        /// Gets the server-side forecast for scheduled recordings.
+        /// </summary>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The recording forecast entries.</returns>
+        Task<IReadOnlyList<RecordingScheduleForecastDto>> GetRecordingScheduleForecast(CancellationToken cancellationToken);
+
+        /// <summary>
         /// Gets the series timers.
         /// </summary>
         /// <param name="query">The query.</param>
@@ -129,6 +136,25 @@ namespace MediaBrowser.Controller.LiveTv
         /// <param name="cancellationToken">The cancellation token.</param>
         /// <returns>Task.</returns>
         Task UpdateTimer(TimerInfoDto timer, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Moves a recording timer up or down in the recording priority list.
+        /// </summary>
+        /// <param name="timerId">The timer identifier.</param>
+        /// <param name="moveUp">Whether to move the timer toward higher priority.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>Task.</returns>
+        Task MoveTimerPriority(string timerId, bool moveUp, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Moves a recording priority entry, where series timers represent all of their episodes.
+        /// </summary>
+        /// <param name="id">The internal timer or series timer identifier.</param>
+        /// <param name="isSeries">Whether the entry represents a series timer.</param>
+        /// <param name="moveUp">Whether to move the entry toward higher priority.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>Task.</returns>
+        Task MoveRecordingPriority(string id, bool isSeries, bool moveUp, CancellationToken cancellationToken);
 
         /// <summary>
         /// Updates the timer.
