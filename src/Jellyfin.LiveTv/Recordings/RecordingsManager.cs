@@ -14,6 +14,7 @@ using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.LiveTv.Configuration;
 using Jellyfin.LiveTv.IO;
 using Jellyfin.LiveTv.Timers;
+using Jellyfin.LiveTv.TunerHosts;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Dto;
@@ -35,8 +36,30 @@ using Microsoft.Extensions.Logging;
 namespace Jellyfin.LiveTv.Recordings;
 
 /// <inheritdoc cref="IRecordingsManager" />
-public sealed class RecordingsManager : IRecordingsManager, IDisposable
+public sealed class RecordingsManager : IRecordingsManager, IActiveRecordingUpdater, IActiveRecordingTunerProvider, IDisposable
 {
+    private static readonly TimeSpan MaxEndMonitorWait = TimeSpan.FromHours(1);
+    private static readonly TimeSpan TunerReleaseTimeout = TimeSpan.FromSeconds(30);
+
+    // How often a recording that is waiting for a tuner tries again when nothing else wakes it, for
+    // tuners released by something other than a recording, such as someone who stops watching live TV.
+    private static readonly TimeSpan TunerWaitPollInterval = TimeSpan.FromMinutes(1);
+
+    // The time between the attempts of waiting recordings that try for a tuner together, which puts
+    // those with a higher priority first.
+    private static readonly TimeSpan TunerTurnSpacing = TimeSpan.FromMilliseconds(500);
+
+    // A tuner device can take a moment to accept a new stream after the recording on it stops, so for this long
+    // after stopping a recording, a recording keeps trying for the tuner.
+    private static readonly TimeSpan StoppedTunerSettleTime = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan StoppedTunerRetryInterval = TimeSpan.FromSeconds(1);
+
+    // A recording that was due to start this long ago, and hasn't started yet, is still expected to start.
+    private static readonly TimeSpan UpcomingRecordingGrace = TimeSpan.FromMinutes(1);
+
+    // How long after a recording with a higher priority is due to start, a recording that waits for it tries again.
+    private static readonly TimeSpan UpcomingRecordingStartDelay = TimeSpan.FromSeconds(5);
+
     private readonly ILogger<RecordingsManager> _logger;
     private readonly IServerConfigurationManager _config;
     private readonly IHttpClientFactory _httpClientFactory;
@@ -50,9 +73,14 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
     private readonly TimerManager _timerManager;
     private readonly SeriesTimerManager _seriesTimerManager;
     private readonly RecordingsMetadataManager _recordingsMetadataManager;
+    private readonly ITunerHostManager _tunerHostManager;
 
-    private readonly ConcurrentDictionary<string, ActiveRecordingInfo> _activeRecordings = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ActiveRecording> _activeRecordings = new(StringComparer.OrdinalIgnoreCase);
+
+    // The recordings that are trying to get a tuner, keyed by timer id, with when each started trying.
+    private readonly ConcurrentDictionary<string, DateTime> _tunerRequests = new(StringComparer.OrdinalIgnoreCase);
     private readonly AsyncNonKeyedLocker _recordingDeleteSemaphore = new();
+    private readonly Lock _recordingPathLock = new();
     private bool _disposed;
 
     /// <summary>
@@ -71,6 +99,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
     /// <param name="timerManager">The <see cref="TimerManager"/>.</param>
     /// <param name="seriesTimerManager">The <see cref="SeriesTimerManager"/>.</param>
     /// <param name="recordingsMetadataManager">The <see cref="RecordingsMetadataManager"/>.</param>
+    /// <param name="tunerHostManager">The <see cref="ITunerHostManager"/>.</param>
     public RecordingsManager(
         ILogger<RecordingsManager> logger,
         IServerConfigurationManager config,
@@ -84,7 +113,8 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         IStreamHelper streamHelper,
         TimerManager timerManager,
         SeriesTimerManager seriesTimerManager,
-        RecordingsMetadataManager recordingsMetadataManager)
+        RecordingsMetadataManager recordingsMetadataManager,
+        ITunerHostManager tunerHostManager)
     {
         _logger = logger;
         _config = config;
@@ -99,6 +129,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         _timerManager = timerManager;
         _seriesTimerManager = seriesTimerManager;
         _recordingsMetadataManager = recordingsMetadataManager;
+        _tunerHostManager = tunerHostManager;
 
         _config.NamedConfigurationUpdated += OnNamedConfigurationUpdated;
     }
@@ -117,7 +148,7 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
 
     /// <inheritdoc />
     public string? GetActiveRecordingPath(string id)
-        => _activeRecordings.GetValueOrDefault(id)?.Path;
+        => _activeRecordings.GetValueOrDefault(id)?.Info.Path;
 
     /// <inheritdoc />
     public ActiveRecordingInfo? GetActiveRecordingInfo(string path)
@@ -127,11 +158,12 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
             return null;
         }
 
-        foreach (var (_, recordingInfo) in _activeRecordings)
+        foreach (var (_, recording) in _activeRecordings)
         {
+            var recordingInfo = recording.Info;
             if (string.Equals(recordingInfo.Path, path, StringComparison.Ordinal)
                 && !recordingInfo.CancellationTokenSource.IsCancellationRequested
-                && recordingInfo.IsInProgress)
+                && recording.IsInProgress)
             {
                 return recordingInfo;
             }
@@ -141,77 +173,19 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
     }
 
     /// <inheritdoc />
-    public IEnumerable<ActiveRecordingInfo> GetActiveRecordings()
-        => _activeRecordings.Values.ToArray();
-
-    /// <inheritdoc />
-    public void UpdateActiveRecordingTimer(TimerInfo timer)
+    IReadOnlyDictionary<string, string> IActiveRecordingTunerProvider.GetActiveRecordingTunerHostIds()
     {
-        if (_activeRecordings.TryGetValue(timer.Id, out var activeRecordingInfo))
+        var tunerHostIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (timerId, recording) in _activeRecordings)
         {
-            activeRecordingInfo.UpdateTimer(timer);
-        }
-    }
-
-    /// <inheritdoc />
-    public async Task<bool> TryStopOptionalPostPaddingAsync(string requestingTimerId)
-    {
-        using (await RecordingPriorityLock.Instance.LockAsync().ConfigureAwait(false))
-        {
-            var requestingTimer = _timerManager.GetTimer(requestingTimerId);
-            if (requestingTimer is null)
+            var tunerHostId = recording.TunerHostId;
+            if (!string.IsNullOrWhiteSpace(tunerHostId))
             {
-                return false;
+                tunerHostIds[timerId] = tunerHostId;
             }
-
-            var requestingPriority = requestingTimer.Priority;
-            var now = DateTime.UtcNow;
-            var candidates = _activeRecordings
-                .Where(pair => !string.Equals(pair.Key, requestingTimerId, StringComparison.OrdinalIgnoreCase))
-                .Select(pair =>
-                {
-                    var hasOptionalPadding = pair.Value.TryGetOptionalPostPaddingState(now, out var priority, out var remaining);
-                    return (Info: pair.Value, HasOptionalPadding: hasOptionalPadding, Priority: priority, Remaining: remaining);
-                })
-                .Where(candidate => candidate.HasOptionalPadding && candidate.Priority > requestingPriority)
-                // Lower numeric priority is higher. Therefore, when several optional
-                // recordings can be preempted, select the lowest-priority one first.
-                .OrderByDescending(candidate => candidate.Priority)
-                .ThenBy(candidate => candidate.Remaining)
-                .ThenBy(candidate => candidate.Info.Id, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            foreach (var candidate in candidates)
-            {
-                var currentRequestingTimer = _timerManager.GetTimer(requestingTimerId);
-                if (currentRequestingTimer is null
-                    || !candidate.Info.TryClaimOptionalPostPadding(DateTime.UtcNow, currentRequestingTimer.Priority))
-                {
-                    continue;
-                }
-
-                _logger.LogInformation(
-                    "Stopping optional post-padding for recording {TimerId} to release a tuner for recording {RequestingTimerId}.",
-                    candidate.Info.Id,
-                    requestingTimerId);
-
-                await candidate.Info.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
-
-                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(30));
-                var completedTask = await Task.WhenAny(candidate.Info.TunerReleasedTask, timeoutTask).ConfigureAwait(false);
-                if (completedTask == candidate.Info.TunerReleasedTask)
-                {
-                    return true;
-                }
-
-                _logger.LogWarning(
-                    "Timed out waiting for optional post-padding recording {TimerId} to release its tuner.",
-                    candidate.Info.Id);
-                return false;
-            }
-
-            return false;
         }
+
+        return tunerHostIds;
     }
 
     /// <inheritdoc />
@@ -368,39 +342,75 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
     /// <inheritdoc />
     public void CancelRecording(string timerId, TimerInfo? timer)
     {
-        if (_activeRecordings.TryGetValue(timerId, out var activeRecordingInfo))
+        if (_activeRecordings.TryGetValue(timerId, out var recording))
         {
             if (timer is not null)
             {
-                activeRecordingInfo.UpdateTimer(timer);
+                recording.UpdateTimer(timer);
             }
 
-            activeRecordingInfo.CancellationTokenSource.Cancel();
+            recording.Info.CancellationTokenSource.Cancel();
         }
     }
 
     /// <inheritdoc />
-    public async Task RecordStream(ActiveRecordingInfo recordingInfo, BaseItem channel)
+    bool IActiveRecordingUpdater.TryUpdateTimer(TimerInfo timer)
+    {
+        ArgumentNullException.ThrowIfNull(timer);
+
+        if (!_activeRecordings.TryGetValue(timer.Id, out var recording))
+        {
+            return false;
+        }
+
+        if (recording.Info.CancellationTokenSource.IsCancellationRequested)
+        {
+            _logger.LogInformation(
+                "Recording {TimerId} is already stopping, so the timer change does not affect it.",
+                timer.Id);
+            return true;
+        }
+
+        var (previousEnd, newEnd) = recording.UpdateTimer(timer);
+        if (previousEnd != newEnd)
+        {
+            _logger.LogInformation(
+                "Recording {TimerId} will now end at {EndDate} instead of {PreviousEndDate}. Post-padding: {PostPadding}.",
+                timer.Id,
+                newEnd,
+                previousEnd,
+                TimeSpan.FromSeconds(timer.PostPaddingSeconds));
+        }
+
+        return true;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <paramref name="recordingEndDate"/> is not used. The end is taken from the timer, so that changes to its
+    /// post-padding apply while the recording is running.
+    /// </remarks>
+    public async Task RecordStream(ActiveRecordingInfo recordingInfo, BaseItem channel, DateTime recordingEndDate)
     {
         ArgumentNullException.ThrowIfNull(recordingInfo);
         ArgumentNullException.ThrowIfNull(channel);
 
         var timer = _timerManager.GetTimer(recordingInfo.Id) ?? recordingInfo.Timer;
-        recordingInfo.UpdateTimer(timer);
         recordingInfo.Path = string.Empty;
+        var recording = new ActiveRecording(recordingInfo, timer);
 
-        if (!_activeRecordings.TryAdd(timer.Id, recordingInfo))
+        if (!_activeRecordings.TryAdd(timer.Id, recording))
         {
-            recordingInfo.TunerReleased();
             _logger.LogInformation("Skipping RecordStream because timer {TimerId} is already being recorded.", timer.Id);
             return;
         }
+
+        var endMonitorTask = MonitorRecordingEndAsync(recording);
 
         string recordingPath = string.Empty;
         string? seriesPath = null;
         string? liveStreamId = null;
         RecordingStatus recordingStatus = RecordingStatus.Error;
-        var liveStreamClosed = true;
 
         try
         {
@@ -412,7 +422,6 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
 
             var remoteMetadata = await FetchInternetMetadata(timer, recordingInfo.CancellationTokenSource.Token).ConfigureAwait(false);
             recordingPath = GetRecordingPath(timer, remoteMetadata, out seriesPath);
-            recordingInfo.Path = recordingPath;
 
             var allMediaSources = await _mediaSourceManager
                 .GetPlaybackMediaSources(channel, null, true, false, recordingInfo.CancellationTokenSource.Token).ConfigureAwait(false);
@@ -424,49 +433,71 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
                 var liveStreamResponse = await OpenLiveStreamWithPreemptionAsync(
                     mediaStreamInfo,
                     channel,
-                    timer.Id).ConfigureAwait(false);
+                    timer,
+                    recordingInfo.CancellationTokenSource.Token).ConfigureAwait(false);
 
                 mediaStreamInfo = liveStreamResponse.Item1.MediaSource;
                 liveStreamId = mediaStreamInfo.LiveStreamId;
                 directStreamProvider = liveStreamResponse.Item2;
-                recordingInfo.TunerHostId = liveStreamResponse.Item1.TunerHostId;
+                recording.TunerHostId = liveStreamResponse.Item1.TunerHostId;
             }
 
             using var recorder = GetRecorder(mediaStreamInfo);
 
             recordingPath = recorder.GetOutputPath(mediaStreamInfo, recordingPath);
-            recordingPath = EnsureFileUnique(recordingPath, timer.Id);
-            recordingInfo.Path = recordingPath;
+
+            // Reserve the path so concurrent recordings don't pick the same file name, but don't
+            // publish it through ActiveRecordingInfo.Path until the recorder has started and the
+            // file exists. Until then Path stays empty, which callers still treat as "active".
+            recordingPath = ReserveUniqueRecordingPath(recording, recordingPath, timer.Id);
 
             _libraryMonitor.ReportFileSystemChangeBeginning(recordingPath);
 
-            _logger.LogInformation("Beginning recording with dynamic end time.");
+            var scheduledRecordingStart = timer.StartDate.AddSeconds(-timer.PrePaddingSeconds);
+            var scheduledRecordingEnd = timer.EndDate.AddSeconds(timer.PostPaddingSeconds);
+
+            _logger.LogInformation(
+                "Beginning recording {TimerId}. Planned duration: {Duration}, ending at {EndDate}. Pre-padding: {PrePadding}. Post-padding: {PostPadding}.",
+                timer.Id,
+                scheduledRecordingEnd - scheduledRecordingStart,
+                scheduledRecordingEnd,
+                TimeSpan.FromSeconds(timer.PrePaddingSeconds),
+                TimeSpan.FromSeconds(timer.PostPaddingSeconds));
             _logger.LogInformation("Writing file to: {Path}", recordingPath);
 
-            async void OnStarted()
+            void OnStarted()
             {
                 var activeTimer = _timerManager.GetTimer(timer.Id) ?? timer;
-                activeTimer.Status = RecordingStatus.InProgress;
-                if (!recordingInfo.TryMarkStarted(activeTimer))
+                if (!recording.TryMarkStarted(activeTimer))
                 {
+                    if (!recording.IsInProgress && !recordingInfo.CancellationTokenSource.IsCancellationRequested)
+                    {
+                        _logger.LogInformation("Timer {TimerId} was cancelled while its recording was starting. Stopping the recording.", timer.Id);
+                        _ = recordingInfo.CancellationTokenSource.CancelAsync();
+                    }
+
                     return;
                 }
 
-                _timerManager.AddOrUpdate(activeTimer, false);
-                _ = MonitorRecordingEndAsync(recordingInfo);
+                recordingInfo.Path = recordingPath;
+                activeTimer.Status = RecordingStatus.InProgress;
 
-                await _recordingsMetadataManager.SaveRecordingMetadata(activeTimer, recordingPath, seriesPath).ConfigureAwait(false);
-                await CreateRecordingFolders().ConfigureAwait(false);
+                try
+                {
+                    _timerManager.AddOrUpdate(activeTimer, false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error saving the in-progress status of timer {TimerId}. The recording continues.", activeTimer.Id);
+                }
 
-                TriggerRefresh(recordingPath);
-                await EnforceKeepUpTo(activeTimer, seriesPath).ConfigureAwait(false);
+                _ = OnRecordingStartedAsync(activeTimer, recordingPath, seriesPath);
             }
 
             await recorder.Record(
                 directStreamProvider,
                 mediaStreamInfo,
                 recordingPath,
-                Timeout.InfiniteTimeSpan,
                 OnStarted,
                 recordingInfo.CancellationTokenSource.Token).ConfigureAwait(false);
 
@@ -478,6 +509,12 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
             _logger.LogInformation("Recording stopped: {RecordPath}", recordingPath);
             recordingStatus = RecordingStatus.Completed;
         }
+        catch (LiveTvConflictException ex)
+        {
+            // The recording waited for a tuner, and none became available before its program ended.
+            _logger.LogWarning("No tuner became available for recording {TimerId} before its program ended. {Message}", timer.Id, ex.Message);
+            recordingStatus = RecordingStatus.Error;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error recording to {RecordPath}", recordingPath);
@@ -485,140 +522,690 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         }
         finally
         {
-            if (!string.IsNullOrWhiteSpace(liveStreamId))
-            {
-                liveStreamClosed = false;
-                try
-                {
-                    await _mediaSourceManager.CloseLiveStream(liveStreamId).ConfigureAwait(false);
-                    liveStreamClosed = true;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error closing live stream");
-                }
-            }
-
-            if (liveStreamClosed)
-            {
-                recordingInfo.TunerReleased();
-            }
-
             try
             {
+                var tunerReleased = true;
+                if (!string.IsNullOrWhiteSpace(liveStreamId))
+                {
+                    try
+                    {
+                        await _mediaSourceManager.CloseLiveStream(liveStreamId).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        tunerReleased = false;
+                        _logger.LogError(ex, "Error closing live stream");
+                    }
+                }
+
+                if (tunerReleased)
+                {
+                    // Wakes a recording with a higher priority that stopped this recording, and recordings
+                    // that are waiting for a tuner.
+                    recording.MarkTunerReleased();
+                }
+
+                if (!recordingInfo.CancellationTokenSource.IsCancellationRequested)
+                {
+                    await recordingInfo.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
+                }
+
+                await endMonitorTask.ConfigureAwait(false);
+
+                // A recording that was stopped for a recording with a higher priority before its program
+                // started holds only pre-padding. Remove it and try again, so that the recording records the
+                // program if a tuner becomes available before the program ends.
+                var stoppedForPriorityAt = recording.StoppedForPriorityAt;
+                if (stoppedForPriorityAt.HasValue
+                    && stoppedForPriorityAt.Value <= (_timerManager.GetTimer(timer.Id) ?? timer).StartDate)
+                {
+                    _logger.LogInformation(
+                        "Recording {TimerId} was stopped for a recording with a higher priority before its program started. It will try again for a tuner.",
+                        timer.Id);
+                    recordingStatus = RecordingStatus.Error;
+                    if (!string.IsNullOrWhiteSpace(recordingPath))
+                    {
+                        DeletePrePaddingRecording(recordingPath);
+                    }
+                }
+
                 if (!string.IsNullOrWhiteSpace(recordingPath))
                 {
                     DeleteFileIfEmpty(recordingPath);
                     TriggerRefresh(recordingPath);
                     _libraryMonitor.ReportFileSystemChangeComplete(recordingPath, false);
                 }
-
-                var finalTimer = _timerManager.GetTimer(timer.Id) ?? recordingInfo.Timer;
-
-                if (recordingStatus != RecordingStatus.Completed
-                    && DateTime.UtcNow < finalTimer.EndDate
-                    && finalTimer.RetryCount < 10)
-                {
-                    const int RetryIntervalSeconds = 60;
-                    _logger.LogInformation("Retrying recording in {0} seconds.", RetryIntervalSeconds);
-
-                    finalTimer.Status = RecordingStatus.New;
-                    finalTimer.PrePaddingSeconds = 0;
-                    finalTimer.StartDate = DateTime.UtcNow.AddSeconds(RetryIntervalSeconds);
-                    finalTimer.RetryCount++;
-                    _timerManager.AddOrUpdate(finalTimer);
-                }
-                else if (!string.IsNullOrWhiteSpace(recordingPath) && File.Exists(recordingPath))
-                {
-                    finalTimer.RecordingPath = recordingPath;
-                    finalTimer.Status = RecordingStatus.Completed;
-                    _timerManager.AddOrUpdate(finalTimer, false);
-                    await PostProcessRecording(recordingPath).ConfigureAwait(false);
-                }
-                else if (_timerManager.GetTimer(timer.Id) is not null)
-                {
-                    _timerManager.Delete(finalTimer);
-                }
             }
             finally
             {
+                // Always unregister, or this timer could not be recorded again until a restart. This
+                // happens before the retry/complete handling below because PostProcessRecording waits
+                // for the user's post-processor, and the recording must not appear active meanwhile.
                 _activeRecordings.TryRemove(timer.Id, out _);
+            }
+
+            var finalTimer = _timerManager.GetTimer(timer.Id) ?? recordingInfo.Timer;
+
+            var isCancelled = finalTimer.Status == RecordingStatus.Cancelled;
+
+            if (!isCancelled
+                && recordingStatus != RecordingStatus.Completed
+                && DateTime.UtcNow < finalTimer.EndDate
+                && finalTimer.RetryCount < 10)
+            {
+                const int RetryIntervalSeconds = 60;
+                _logger.LogInformation("Retrying recording in {0} seconds.", RetryIntervalSeconds);
+
+                finalTimer.Status = RecordingStatus.New;
+                var retryAt = DateTime.UtcNow.AddSeconds(RetryIntervalSeconds);
+                if (retryAt < finalTimer.StartDate)
+                {
+                    // Before the program starts, retry within the pre-padding and keep the program's start.
+                    finalTimer.PrePaddingSeconds = (int)(finalTimer.StartDate - retryAt).TotalSeconds;
+                }
+                else
+                {
+                    finalTimer.PrePaddingSeconds = 0;
+                    finalTimer.StartDate = retryAt;
+                }
+
+                finalTimer.RetryCount++;
+                _timerManager.AddOrUpdate(finalTimer);
+            }
+            else if (!string.IsNullOrWhiteSpace(recordingPath) && File.Exists(recordingPath))
+            {
+                finalTimer.RecordingPath = recordingPath;
+                finalTimer.Status = RecordingStatus.Completed;
+                _timerManager.AddOrUpdate(finalTimer, false);
+                await PostProcessRecording(recordingPath).ConfigureAwait(false);
+            }
+            else if (!isCancelled && !_disposed && _timerManager.GetTimer(timer.Id) is not null)
+            {
+                // Nothing was recorded. A recording stopped by a shutdown keeps its timer, so a recording
+                // that was waiting for a tuner tries again when the server starts.
+                _timerManager.Delete(finalTimer);
             }
         }
     }
 
+    /// <summary>
+    /// Opens a live stream for a recording. When no tuner is free, it stops a recording with a lower priority
+    /// that holds a tuner the channel can use, or else waits for a tuner, so that the recording starts late
+    /// rather than not at all. It gives up when the program ends.
+    /// </summary>
+    /// <remarks>
+    /// It stops at most one recording. A tuner host reports any failure to open a stream as a conflict, so if
+    /// the stream still can't be opened, for example because the channel can't be tuned, stopping more
+    /// recordings might not help.
+    /// </remarks>
     private async Task<Tuple<LiveStreamResponse, IDirectStreamProvider>> OpenLiveStreamWithPreemptionAsync(
         MediaSourceInfo mediaStreamInfo,
         BaseItem channel,
-        string requestingTimerId)
+        TimerInfo timer,
+        CancellationToken cancellationToken)
     {
-        while (true)
+        DateTime? waitingSince = null;
+        DateTime? stoppedRecordingAt = null;
+        HashSet<string>? channelTunerHostIds = null;
+        _tunerRequests[timer.Id] = DateTime.UtcNow;
+
+        try
         {
-            try
+            while (true)
             {
-                // Do not pass the recording cancellation token here. OpenLiveStreamInternal
-                // registers the live stream before its media probing completes. If cancellation
-                // aborts that operation before this method returns, RecordStream would not yet
-                // have the LiveStreamId needed to close the tuner.
-                return await _mediaSourceManager.OpenLiveStreamInternal(
-                    new LiveStreamRequest
-                    {
-                        ItemId = channel.Id,
-                        OpenToken = mediaStreamInfo.OpenToken
-                    },
-                    CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (LiveTvConflictException)
-            {
-                if (!await TryStopOptionalPostPaddingAsync(requestingTimerId).ConfigureAwait(false))
+                DateTime? retryAt = null;
+
+                // Recordings with a higher priority that are trying for a tuner at the same time go first.
+                await WaitForTunerTurnAsync(timer.Id, cancellationToken).ConfigureAwait(false);
+
+                try
                 {
-                    throw;
+                    // Do not pass the recording cancellation token here. OpenLiveStreamInternal
+                    // registers the live stream before its media probing completes. If cancellation
+                    // aborts that operation before this method returns, RecordStream would not yet
+                    // have the LiveStreamId needed to close the tuner.
+                    var liveStream = await _mediaSourceManager.OpenLiveStreamInternal(
+                        new LiveStreamRequest
+                        {
+                            ItemId = channel.Id,
+                            OpenToken = mediaStreamInfo.OpenToken
+                        },
+                        CancellationToken.None).ConfigureAwait(false);
+
+                    if (waitingSince.HasValue)
+                    {
+                        _logger.LogInformation("Recording {TimerId} got a tuner after waiting {Wait}.", timer.Id, DateTime.UtcNow - waitingSince.Value);
+                    }
+
+                    return liveStream;
+                }
+                catch (LiveTvConflictException)
+                {
+                    if (stoppedRecordingAt.HasValue)
+                    {
+                        if (DateTime.UtcNow - stoppedRecordingAt.Value < StoppedTunerSettleTime)
+                        {
+                            // The tuner of the recording that was stopped may not accept a stream yet.
+                            await Task.Delay(StoppedTunerRetryInterval, cancellationToken).ConfigureAwait(false);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        if (channelTunerHostIds is null)
+                        {
+                            channelTunerHostIds = await GetTunerHostIdsForChannelAsync(channel.ExternalId, cancellationToken).ConfigureAwait(false);
+                            if (channelTunerHostIds.Count == 0)
+                            {
+                                _logger.LogWarning(
+                                    "No tuner host is known to carry channel {ChannelId}, so recording {TimerId} doesn't stop a recording with a lower priority to get a tuner.",
+                                    channel.ExternalId,
+                                    timer.Id);
+                            }
+                        }
+
+                        var (stopped, upcomingStart) = await TryStopLowerPriorityRecordingAsync(timer.Id, channelTunerHostIds, cancellationToken).ConfigureAwait(false);
+                        if (stopped)
+                        {
+                            // Don't open a tuner for a recording that was stopped while it waited for one.
+                            cancellationToken.ThrowIfCancellationRequested();
+                            stoppedRecordingAt = DateTime.UtcNow;
+                            continue;
+                        }
+
+                        // It didn't stop a recording because a recording with a higher priority would stop it again
+                        // before its program starts. Try again once that recording has started.
+                        if (upcomingStart.HasValue && upcomingStart.Value + UpcomingRecordingStartDelay > DateTime.UtcNow)
+                        {
+                            retryAt = upcomingStart.Value + UpcomingRecordingStartDelay;
+                        }
+                    }
+
+                    // Every tuner that can record the channel is in use by recordings with the same or a higher
+                    // priority, or by something else, or by a recording that a recording with a higher priority will
+                    // stop first, or the stream can't be opened even after stopping a recording. Wait for a tuner to
+                    // be released, unless the program ends first.
+                    var programEnd = GetProgramEnd(timer);
+                    if (DateTime.UtcNow >= programEnd)
+                    {
+                        throw;
+                    }
+
+                    if (!waitingSince.HasValue)
+                    {
+                        waitingSince = DateTime.UtcNow;
+                        _logger.LogInformation(
+                            "No tuner is available for recording {TimerId}. It will start when a tuner is released, unless its program ends first at {EndDate}.",
+                            timer.Id,
+                            programEnd);
+                    }
                 }
 
-                _logger.LogInformation("A tuner conflict was resolved by ending optional post-padding. Retrying tuner acquisition for recording {TimerId}.", requestingTimerId);
+                await WaitForReleasedTunerAsync(timer.Id, retryAt, cancellationToken).ConfigureAwait(false);
+
+                // A recording that waited for a tuner doesn't start once its program has ended, when only its
+                // post-padding would be left to record. The schedule forecast assumes the same.
+                if (DateTime.UtcNow >= GetProgramEnd(timer))
+                {
+                    throw new LiveTvConflictException("The program ended before a tuner became available.");
+                }
             }
+        }
+        finally
+        {
+            _tunerRequests.TryRemove(timer.Id, out _);
         }
     }
 
-    private async Task MonitorRecordingEndAsync(ActiveRecordingInfo recordingInfo)
+    // The end of the timer's program, without post-padding. The timer can change while its recording waits.
+    private DateTime GetProgramEnd(TimerInfo timer) => (_timerManager.GetTimer(timer.Id) ?? timer).EndDate;
+
+    /// <summary>
+    /// Delays an attempt to open a tuner by the number of recordings trying for a tuner that go first:
+    /// those with a higher priority, or the same priority and a longer wait. When a tuner is released,
+    /// waiting recordings try together, and opening live streams is serialized, so the first to try gets it.
+    /// </summary>
+    private async Task WaitForTunerTurnAsync(string timerId, CancellationToken cancellationToken)
     {
+        if (_tunerRequests.Count < 2)
+        {
+            return;
+        }
+
+        var timer = _timerManager.GetTimer(timerId);
+        if (timer is null)
+        {
+            return;
+        }
+
+        var seriesPriorities = GetSeriesTimerPriorities();
+        var priority = GetRecordingPriority(timer, seriesPriorities);
+        var requestedAt = _tunerRequests.TryGetValue(timerId, out var since) ? since : DateTime.MaxValue;
+        var aheadCount = 0;
+        foreach (var (otherTimerId, otherRequestedAt) in _tunerRequests)
+        {
+            if (string.Equals(otherTimerId, timerId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var otherTimer = _timerManager.GetTimer(otherTimerId);
+            if (otherTimer is null)
+            {
+                continue;
+            }
+
+            var otherPriority = GetRecordingPriority(otherTimer, seriesPriorities);
+            if (otherPriority < priority || (otherPriority == priority && otherRequestedAt < requestedAt))
+            {
+                aheadCount++;
+            }
+        }
+
+        if (aheadCount > 0)
+        {
+            await Task.Delay(TunerTurnSpacing * aheadCount, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Waits until a tuner may have become available: when another recording releases its tuner, when another
+    /// recording starts, which lets a recording with a higher priority stop it, at <paramref name="retryAt"/>, or
+    /// after <see cref="TunerWaitPollInterval"/>.
+    /// </summary>
+    private async Task WaitForReleasedTunerAsync(string timerId, DateTime? retryAt, CancellationToken cancellationToken)
+    {
+        var wait = TunerWaitPollInterval;
+        if (retryAt.HasValue && retryAt.Value - DateTime.UtcNow < wait)
+        {
+            wait = retryAt.Value - DateTime.UtcNow;
+        }
+
+        var wakeUps = new List<Task>();
+        foreach (var (otherTimerId, recording) in _activeRecordings)
+        {
+            if (string.Equals(otherTimerId, timerId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!recording.TunerReleased.IsCompleted)
+            {
+                wakeUps.Add(recording.TunerReleased);
+            }
+
+            if (!recording.Started.IsCompleted)
+            {
+                wakeUps.Add(recording.Started);
+            }
+        }
+
+        wakeUps.Add(Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.Zero, cancellationToken));
+        await Task.WhenAny(wakeUps).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>
+    /// Stops a running recording with a lower priority than the requesting recording, on a tuner host that can
+    /// record the requesting recording's channel, and waits for its tuner to be released. The recording with the
+    /// lowest priority is stopped first, and of those, the one that loses the least of its program.
+    /// </summary>
+    /// <remarks>
+    /// A recording that hasn't reached its program yet doesn't take a tuner that a recording with a higher priority,
+    /// due to start before its program, would take back from it: it would record only pre-padding, which is deleted,
+    /// and cut the other recording short for nothing. See <see cref="PreemptionLookahead"/>.
+    /// </remarks>
+    /// <param name="requestingTimerId">The timer id of the recording that needs a tuner.</param>
+    /// <param name="tunerHostIds">The tuner hosts that carry the channel of the recording that needs a tuner.</param>
+    /// <param name="requestingCancellationToken">The cancellation token of the recording that needs a tuner.</param>
+    /// <returns>
+    /// Whether a recording was stopped. When none was, because a recording with a higher priority would stop the
+    /// requesting recording again, also when that recording is due to start.
+    /// </returns>
+    private async Task<(bool Stopped, DateTime? UpcomingStart)> TryStopLowerPriorityRecordingAsync(
+        string requestingTimerId,
+        HashSet<string> tunerHostIds,
+        CancellationToken requestingCancellationToken)
+    {
+        if (tunerHostIds.Count == 0)
+        {
+            return (false, null);
+        }
+
+        // Looking up the tuner hosts of their channels reads files, so it happens before the lock.
+        var upcoming = await GetUpcomingRecordingsBeforeProgramAsync(requestingTimerId, requestingCancellationToken).ConfigureAwait(false);
+
+        ActiveRecording? stopped = null;
+        var stoppedPriority = 0;
+        var stoppedProgramLeft = TimeSpan.Zero;
+        var requestingPriority = 0;
+        PreemptionLookahead.UpcomingRecording? stoppedBy = null;
+
+        // Choose and claim the recording under the priority lock, so priorities can't be reordered
+        // meanwhile. The lock isn't held while waiting for the tuner.
+        using (await RecordingPriorityLock.Instance.LockAsync(requestingCancellationToken).ConfigureAwait(false))
+        {
+            requestingCancellationToken.ThrowIfCancellationRequested();
+
+            var requestingTimer = _timerManager.GetTimer(requestingTimerId);
+            if (requestingTimer is null)
+            {
+                return (false, null);
+            }
+
+            // Rank recordings as the recording priority list and the schedule forecast do. Episodes
+            // take their series' priority: their own Priority isn't updated while they are cancelled,
+            // so an episode that is re-enabled later can still carry an old value.
+            var seriesPriorities = GetSeriesTimerPriorities();
+            requestingPriority = GetRecordingPriority(requestingTimer, seriesPriorities);
+            var now = DateTime.UtcNow;
+            var candidates = _activeRecordings
+                .Where(pair => !string.Equals(pair.Key, requestingTimerId, StringComparison.OrdinalIgnoreCase))
+                .Where(pair => pair.Value.TunerHostId is not null && tunerHostIds.Contains(pair.Value.TunerHostId))
+                .Select(pair => (
+                    Recording: pair.Value,
+                    Priority: GetRecordingPriority(_timerManager.GetTimer(pair.Key) ?? pair.Value.Info.Timer, seriesPriorities),
+                    ProgramLeft: pair.Value.GetProgramTimeRemaining(now),
+                    TimeLeft: pair.Value.GetTimeRemaining(now, out _)))
+                // A recording with a higher priority always gets a tuner, even if a recording with a lower
+                // priority (a higher number) has to stop before its program ends. Recordings with the same or
+                // a higher priority keep their tuners, and the requesting recording starts late instead.
+                .Where(candidate => candidate.Priority > requestingPriority)
+                .OrderByDescending(candidate => candidate.Priority)
+                .ThenBy(candidate => candidate.ProgramLeft)
+                .ThenBy(candidate => candidate.TimeLeft)
+                .ThenBy(candidate => candidate.Recording.Info.Id, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var lookahead = upcoming.Where(recording => recording.Priority < requestingPriority).ToList();
+            var tunerUses = GetTunerUses(now, seriesPriorities);
+            var tunerHosts = GetTunerHostCapacities();
+            var requestingEnd = requestingTimer.EndDate.AddSeconds(Math.Max(0, requestingTimer.PostPaddingSeconds));
+
+            foreach (var candidate in candidates)
+            {
+                if (lookahead.Count > 0)
+                {
+                    var stopsBeforeProgram = PreemptionLookahead.FindStopBeforeProgram(
+                        new PreemptionLookahead.TunerUse(requestingTimerId, candidate.Recording.TunerHostId ?? string.Empty, requestingPriority, requestingTimer.EndDate, requestingEnd),
+                        requestingTimer.StartDate,
+                        tunerUses.Where(use => !string.Equals(use.Id, candidate.Recording.Info.Id, StringComparison.OrdinalIgnoreCase)),
+                        lookahead,
+                        tunerHosts);
+                    if (stopsBeforeProgram is not null)
+                    {
+                        stoppedBy ??= stopsBeforeProgram;
+                        continue;
+                    }
+                }
+
+                if (candidate.Recording.TryClaimForHigherPriority(now))
+                {
+                    stopped = candidate.Recording;
+                    stoppedPriority = candidate.Priority;
+                    stoppedProgramLeft = candidate.ProgramLeft;
+                    break;
+                }
+            }
+        }
+
+        if (stopped is null)
+        {
+            if (stoppedBy is null)
+            {
+                return (false, null);
+            }
+
+            _logger.LogInformation(
+                "Recording {TimerId} (priority {Priority}) doesn't stop a recording with a lower priority yet: recording {UpcomingTimerId} (priority {UpcomingPriority}) starts at {UpcomingStart}, before this recording's program, and would stop it again. Lower numbers are higher priority.",
+                requestingTimerId,
+                requestingPriority,
+                stoppedBy.Id,
+                stoppedBy.Priority,
+                stoppedBy.Start);
+            return (false, stoppedBy.Start);
+        }
+
+        _logger.LogInformation(
+            "Stopping recording {TimerId} (priority {Priority}) with {ProgramLeft} of its program left, to release a tuner for recording {RequestingTimerId} (priority {RequestingPriority}). Lower numbers are higher priority.",
+            stopped.Info.Id,
+            stoppedPriority,
+            stoppedProgramLeft,
+            requestingTimerId,
+            requestingPriority);
+
+        await stopped.Info.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
+
         try
         {
-            while (!recordingInfo.CancellationTokenSource.IsCancellationRequested)
-            {
-                var state = recordingInfo.GetTimerState();
-                var recordingEndDate = state.EndDate.AddSeconds(state.PostPaddingSeconds);
-                var remaining = recordingEndDate - DateTime.UtcNow;
+            await stopped.TunerReleased
+                .WaitAsync(TunerReleaseTimeout, requestingCancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Timed out waiting for recording {TimerId} to release its tuner.",
+                stopped.Info.Id);
+        }
 
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Gets the recordings with a higher priority than a recording that are due to start before its program does,
+    /// and haven't started, for <see cref="PreemptionLookahead"/>.
+    /// </summary>
+    /// <param name="requestingTimerId">The timer id of the recording.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The recordings, in the order they start.</returns>
+    private async Task<List<PreemptionLookahead.UpcomingRecording>> GetUpcomingRecordingsBeforeProgramAsync(
+        string requestingTimerId,
+        CancellationToken cancellationToken)
+    {
+        var upcoming = new List<PreemptionLookahead.UpcomingRecording>();
+        var requestingTimer = _timerManager.GetTimer(requestingTimerId);
+        var now = DateTime.UtcNow;
+        if (requestingTimer is null || now >= requestingTimer.StartDate)
+        {
+            return upcoming;
+        }
+
+        var seriesPriorities = GetSeriesTimerPriorities();
+        var requestingPriority = GetRecordingPriority(requestingTimer, seriesPriorities);
+        var tunerHostIdsByChannel = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var timer in _timerManager.GetAll())
+        {
+            var start = timer.StartDate.AddSeconds(-Math.Max(0, timer.PrePaddingSeconds));
+            var priority = GetRecordingPriority(timer, seriesPriorities);
+            if (timer.Status != RecordingStatus.New
+                || priority >= requestingPriority
+                || start < now - UpcomingRecordingGrace
+                || start > requestingTimer.StartDate
+                || string.Equals(timer.Id, requestingTimerId, StringComparison.OrdinalIgnoreCase)
+                || _activeRecordings.ContainsKey(timer.Id))
+            {
+                continue;
+            }
+
+            // A timer without a channel can record on any channel.
+            var channelId = timer.ChannelId ?? string.Empty;
+            if (!tunerHostIdsByChannel.TryGetValue(channelId, out var tunerHostIds))
+            {
+                tunerHostIds = string.IsNullOrWhiteSpace(channelId)
+                    ? GetTunerHostCapacities().Select(host => host.Id).ToHashSet(StringComparer.OrdinalIgnoreCase)
+                    : await GetTunerHostIdsForChannelAsync(channelId, cancellationToken).ConfigureAwait(false);
+                tunerHostIdsByChannel[channelId] = tunerHostIds;
+            }
+
+            upcoming.Add(new PreemptionLookahead.UpcomingRecording(
+                timer.Id,
+                priority,
+                start,
+                timer.EndDate,
+                timer.EndDate.AddSeconds(Math.Max(0, timer.PostPaddingSeconds)),
+                tunerHostIds));
+        }
+
+        return upcoming
+            .OrderBy(recording => recording.Start)
+            .ThenBy(recording => recording.Priority)
+            .ThenBy(recording => recording.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Gets the running recordings that hold tuners, for <see cref="PreemptionLookahead"/>. Recordings that are being
+    /// stopped are left out.
+    /// </summary>
+    /// <param name="now">The current time.</param>
+    /// <param name="seriesPriorities">The priorities of the series timers.</param>
+    /// <returns>The recordings that hold tuners.</returns>
+    private List<PreemptionLookahead.TunerUse> GetTunerUses(DateTime now, IReadOnlyDictionary<string, int> seriesPriorities)
+    {
+        return _activeRecordings
+            .Where(pair => pair.Value.TunerHostId is not null
+                && pair.Value.StoppedForPriorityAt is null
+                && !pair.Value.TunerReleased.IsCompleted
+                && !pair.Value.Info.CancellationTokenSource.IsCancellationRequested)
+            .Select(pair => new PreemptionLookahead.TunerUse(
+                pair.Key,
+                pair.Value.TunerHostId ?? string.Empty,
+                GetRecordingPriority(_timerManager.GetTimer(pair.Key) ?? pair.Value.Info.Timer, seriesPriorities),
+                now + pair.Value.GetProgramTimeRemaining(now),
+                now + pair.Value.GetTimeRemaining(now, out _)))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Gets the configured tuner hosts with their numbers of tuners, in the order recordings try them, for
+    /// <see cref="PreemptionLookahead"/>.
+    /// </summary>
+    /// <returns>The tuner hosts.</returns>
+    private List<PreemptionLookahead.TunerHostCapacity> GetTunerHostCapacities()
+    {
+        return _config.GetLiveTvConfiguration().TunerHosts
+            .Where(host => !string.IsNullOrWhiteSpace(host.Id))
+            .Select(host => new PreemptionLookahead.TunerHostCapacity(host.Id, host.TunerCount > 0 ? host.TunerCount : null))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Gets the configured tuner hosts that carry a channel, from their channel lists, which are cached.
+    /// </summary>
+    /// <param name="channelId">The channel id of a timer.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The ids of the tuner hosts that can record the channel.</returns>
+    private async Task<HashSet<string>> GetTunerHostIdsForChannelAsync(string channelId, CancellationToken cancellationToken)
+    {
+        var tunerHostIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(channelId))
+        {
+            return tunerHostIds;
+        }
+
+        foreach (var host in _config.GetLiveTvConfiguration().TunerHosts)
+        {
+            if (string.IsNullOrWhiteSpace(host.Id))
+            {
+                continue;
+            }
+
+            var tunerHost = _tunerHostManager.TunerHosts
+                .FirstOrDefault(i => string.Equals(i.Type, host.Type, StringComparison.OrdinalIgnoreCase));
+            if (tunerHost is not BaseTunerHost baseTunerHost)
+            {
+                continue;
+            }
+
+            var channels = await baseTunerHost.GetChannelsForRecordingForecast(host, cancellationToken).ConfigureAwait(false);
+            if (channels.Exists(channel => string.Equals(channel.Id, channelId, StringComparison.OrdinalIgnoreCase)))
+            {
+                tunerHostIds.Add(host.Id);
+            }
+        }
+
+        return tunerHostIds;
+    }
+
+    /// <summary>
+    /// Gets the priority that a timer records with: its series timer's priority when it belongs to one,
+    /// otherwise its own. Lower values are higher priority.
+    /// </summary>
+    /// <param name="timer">The timer.</param>
+    /// <param name="seriesPriorities">The priority of each series timer, keyed by series timer id.</param>
+    /// <returns>The recording priority.</returns>
+    private static int GetRecordingPriority(TimerInfo timer, IReadOnlyDictionary<string, int> seriesPriorities)
+        => !string.IsNullOrWhiteSpace(timer.SeriesTimerId)
+            && seriesPriorities.TryGetValue(timer.SeriesTimerId, out var seriesPriority)
+                ? seriesPriority
+                : timer.Priority;
+
+    private Dictionary<string, int> GetSeriesTimerPriorities()
+    {
+        var priorities = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var seriesTimer in _seriesTimerManager.GetAll())
+        {
+            if (!string.IsNullOrWhiteSpace(seriesTimer.Id))
+            {
+                priorities[seriesTimer.Id] = seriesTimer.Priority;
+            }
+        }
+
+        return priorities;
+    }
+
+    private async Task MonitorRecordingEndAsync(ActiveRecording recording)
+    {
+        var cancellationTokenSource = recording.Info.CancellationTokenSource;
+
+        try
+        {
+            while (!cancellationTokenSource.IsCancellationRequested)
+            {
+                var remaining = recording.GetTimeRemaining(DateTime.UtcNow, out var timerChanged);
                 if (remaining <= TimeSpan.Zero)
                 {
-                    if (recordingInfo.TryClaimEndCancellation(DateTime.UtcNow))
-                    {
-                        await recordingInfo.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
-                        return;
-                    }
-
-                    continue;
-                }
-
-                var delayTask = Task.Delay(remaining, recordingInfo.CancellationTokenSource.Token);
-                var timerChangedTask = state.TimerChangedTask;
-                var completedTask = await Task.WhenAny(delayTask, timerChangedTask, recordingInfo.TunerReleasedTask).ConfigureAwait(false);
-
-                if (completedTask == recordingInfo.TunerReleasedTask || recordingInfo.CancellationTokenSource.IsCancellationRequested)
-                {
+                    _logger.LogInformation("Recording {TimerId} has reached its scheduled end. Stopping the recording.", recording.Info.Id);
+                    await cancellationTokenSource.CancelAsync().ConfigureAwait(false);
                     return;
                 }
 
-                if (completedTask == delayTask && recordingInfo.TryClaimEndCancellation(DateTime.UtcNow))
-                {
-                    await recordingInfo.CancellationTokenSource.CancelAsync().ConfigureAwait(false);
-                    return;
-                }
+                // Cap each wait: Task.Delay rejects delays over ~49.7 days, and the loop
+                // re-evaluates the end time after every wake-up anyway.
+                var wait = remaining < MaxEndMonitorWait ? remaining : MaxEndMonitorWait;
+
+                using var delayCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationTokenSource.Token);
+                var delayTask = Task.Delay(wait, delayCancellation.Token);
+                await Task.WhenAny(delayTask, timerChanged).ConfigureAwait(false);
+                await delayCancellation.CancelAsync().ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
         {
+        }
+        catch (Exception ex)
+        {
+            // The monitor is the only thing that ends a recording on schedule. If it fails,
+            // stop the recording rather than letting it run indefinitely.
+            _logger.LogError(ex, "Error monitoring recording end for {TimerId}. Stopping the recording.", recording.Info.Id);
+            await cancellationTokenSource.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task OnRecordingStartedAsync(TimerInfo timer, string recordingPath, string? seriesPath)
+    {
+        try
+        {
+            await _recordingsMetadataManager.SaveRecordingMetadata(timer, recordingPath, seriesPath).ConfigureAwait(false);
+            await CreateRecordingFolders().ConfigureAwait(false);
+
+            TriggerRefresh(recordingPath);
+            await EnforceKeepUpTo(timer, seriesPath).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error completing recording start processing for {TimerId}.", timer.Id);
         }
     }
 
@@ -630,14 +1217,14 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
             return;
         }
 
+        // Set first, so that recordings stopped by the shutdown can tell, and keep their timers.
+        _disposed = true;
         _recordingDeleteSemaphore.Dispose();
 
         foreach (var pair in _activeRecordings.ToList())
         {
-            pair.Value.CancellationTokenSource.Cancel();
+            pair.Value.Info.CancellationTokenSource.Cancel();
         }
-
-        _disposed = true;
     }
 
     private async void OnNamedConfigurationUpdated(object? sender, ConfigurationUpdateEventArgs e)
@@ -780,6 +1367,37 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         var recordingFileName = _fileSystem.GetValidFilename(RecordingHelper.GetRecordingName(timer)).Trim() + ".ts";
 
         return Path.Combine(recordingPath, recordingFileName);
+    }
+
+    /// <summary>
+    /// Deletes a recording that holds only pre-padding, together with the metadata saved next to it.
+    /// </summary>
+    /// <param name="recordingPath">The path of the recording.</param>
+    private void DeletePrePaddingRecording(string recordingPath)
+    {
+        var paths = new List<string> { recordingPath, Path.ChangeExtension(recordingPath, ".nfo") };
+        var directory = Path.GetDirectoryName(recordingPath);
+        if (!string.IsNullOrEmpty(directory) && Directory.Exists(directory))
+        {
+            var thumbPrefix = Path.GetFileNameWithoutExtension(recordingPath) + "-thumb.";
+            paths.AddRange(Directory.EnumerateFiles(directory)
+                .Where(path => Path.GetFileName(path).StartsWith(thumbPrefix, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        foreach (var path in paths)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    _fileSystem.DeleteFile(path);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogError(ex, "Error deleting {Path}, which a recording stopped before its program started left behind", path);
+            }
+        }
     }
 
     private void DeleteFileIfEmpty(string path)
@@ -966,6 +1584,18 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
         _timerManager.Delete(timer);
     }
 
+    private string ReserveUniqueRecordingPath(ActiveRecording recording, string path, string timerId)
+    {
+        // Choosing and reserving the path in one locked step keeps two recordings that start
+        // together from picking the same file.
+        lock (_recordingPathLock)
+        {
+            var uniquePath = EnsureFileUnique(path, timerId);
+            recording.ReservedPath = uniquePath;
+            return uniquePath;
+        }
+    }
+
     private string EnsureFileUnique(string path, string timerId)
     {
         var parent = Path.GetDirectoryName(path)!;
@@ -974,8 +1604,8 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
 
         var index = 1;
         while (File.Exists(path) || _activeRecordings.Any(i
-                   => string.Equals(i.Value.Path, path, StringComparison.OrdinalIgnoreCase)
-                      && !string.Equals(i.Value.Timer.Id, timerId, StringComparison.OrdinalIgnoreCase)))
+                   => string.Equals(i.Value.ReservedPath ?? i.Value.Info.Path, path, StringComparison.OrdinalIgnoreCase)
+                      && !string.Equals(i.Key, timerId, StringComparison.OrdinalIgnoreCase)))
         {
             name += " - " + index.ToString(CultureInfo.InvariantCulture);
 

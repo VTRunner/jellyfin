@@ -14,6 +14,7 @@ using Jellyfin.Data.Events;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Extensions;
 using Jellyfin.LiveTv.Configuration;
+using Jellyfin.LiveTv.Recordings;
 using Jellyfin.LiveTv.Timers;
 using Jellyfin.LiveTv.TunerHosts;
 using Jellyfin.LiveTv.TunerHosts.HdHomerun;
@@ -38,6 +39,7 @@ namespace Jellyfin.LiveTv
         private readonly ITunerHostManager _tunerHostManager;
         private readonly IListingsManager _listingsManager;
         private readonly IRecordingsManager _recordingsManager;
+        private readonly IActiveRecordingUpdater _activeRecordingUpdater;
         private readonly ILibraryManager _libraryManager;
         private readonly LiveTvDtoService _tvDtoService;
         private readonly TimerManager _timerManager;
@@ -49,6 +51,7 @@ namespace Jellyfin.LiveTv
             ITunerHostManager tunerHostManager,
             IListingsManager listingsManager,
             IRecordingsManager recordingsManager,
+            IActiveRecordingUpdater activeRecordingUpdater,
             ILibraryManager libraryManager,
             LiveTvDtoService tvDtoService,
             TimerManager timerManager,
@@ -60,6 +63,7 @@ namespace Jellyfin.LiveTv
             _tunerHostManager = tunerHostManager;
             _listingsManager = listingsManager;
             _recordingsManager = recordingsManager;
+            _activeRecordingUpdater = activeRecordingUpdater;
             _tvDtoService = tvDtoService;
             _timerManager = timerManager;
             _seriesTimerManager = seriesTimerManager;
@@ -229,6 +233,7 @@ namespace Jellyfin.LiveTv
 
             return channels;
         }
+
         public Task CancelSeriesTimerAsync(string timerId, CancellationToken cancellationToken)
         {
             var timers = _timerManager
@@ -337,6 +342,8 @@ namespace Jellyfin.LiveTv
                 CopyProgramInfoToTimerInfo(programInfo, info);
             }
 
+            info.PrePaddingSeconds = Math.Max(0, info.PrePaddingSeconds);
+            info.PostPaddingSeconds = Math.Max(0, info.PostPaddingSeconds);
             info.IsManual = true;
             _timerManager.Add(info);
 
@@ -348,6 +355,8 @@ namespace Jellyfin.LiveTv
         public async Task<string> CreateSeriesTimer(SeriesTimerInfo info, CancellationToken cancellationToken)
         {
             info.Id = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+            info.PrePaddingSeconds = Math.Max(0, info.PrePaddingSeconds);
+            info.PostPaddingSeconds = Math.Max(0, info.PostPaddingSeconds);
 
             // populate info.seriesID
             var program = GetProgramInfoFromCache(info.ProgramId);
@@ -405,8 +414,8 @@ namespace Jellyfin.LiveTv
                 instance.EndDate = info.EndDate;
                 instance.IsPostPaddingRequired = info.IsPostPaddingRequired;
                 instance.IsPrePaddingRequired = info.IsPrePaddingRequired;
-                instance.PostPaddingSeconds = info.PostPaddingSeconds;
-                instance.PrePaddingSeconds = info.PrePaddingSeconds;
+                instance.PostPaddingSeconds = Math.Max(0, info.PostPaddingSeconds);
+                instance.PrePaddingSeconds = Math.Max(0, info.PrePaddingSeconds);
                 instance.Priority = info.Priority;
                 instance.RecordAnyChannel = info.RecordAnyChannel;
                 instance.RecordAnyTime = info.RecordAnyTime;
@@ -435,7 +444,7 @@ namespace Jellyfin.LiveTv
             }
 
             // Post-padding can be changed even while the recording is active.
-            existingTimer.PostPaddingSeconds = Math.Max(updatedTimer.PostPaddingSeconds, 0);
+            existingTimer.PostPaddingSeconds = Math.Max(0, updatedTimer.PostPaddingSeconds);
             existingTimer.IsPostPaddingRequired = updatedTimer.IsPostPaddingRequired;
 
             // Series timer priority is authoritative for every child timer. One-off timers
@@ -454,19 +463,17 @@ namespace Jellyfin.LiveTv
                 }
             }
 
-            if (_recordingsManager.GetActiveRecordingPath(updatedTimer.Id) is null)
+            // An active recording applies the new post-padding while it runs.
+            if (_activeRecordingUpdater.TryUpdateTimer(existingTimer))
             {
-                // Only non-active recordings can have their pre-padding changed.
-                existingTimer.PrePaddingSeconds = updatedTimer.PrePaddingSeconds;
-                existingTimer.IsPrePaddingRequired = updatedTimer.IsPrePaddingRequired;
-                _timerManager.Update(existingTimer);
+                _timerManager.AddOrUpdate(existingTimer, false);
             }
             else
             {
-                // Persist the active timer without restarting the start timer, then notify
-                // the active recording so its dynamic end-time waiter recalculates.
-                _timerManager.AddOrUpdate(existingTimer, false);
-                _recordingsManager.UpdateActiveRecordingTimer(existingTimer);
+                // Only non-active recordings can have their pre-padding changed.
+                existingTimer.PrePaddingSeconds = Math.Max(0, updatedTimer.PrePaddingSeconds);
+                existingTimer.IsPrePaddingRequired = updatedTimer.IsPrePaddingRequired;
+                _timerManager.Update(existingTimer);
             }
 
             return Task.CompletedTask;
@@ -482,15 +489,14 @@ namespace Jellyfin.LiveTv
 
             instance.Priority = priority;
 
-            if (_recordingsManager.GetActiveRecordingPath(timerId) is null)
-            {
-                _timerManager.Update(instance);
-            }
-            else
+            if (_activeRecordingUpdater.TryUpdateTimer(instance))
             {
                 // Preserve the active timer's running state while persisting the new priority.
                 _timerManager.AddOrUpdate(instance, false);
-                _recordingsManager.UpdateActiveRecordingTimer(instance);
+            }
+            else
+            {
+                _timerManager.Update(instance);
             }
 
             return Task.CompletedTask;
@@ -518,17 +524,16 @@ namespace Jellyfin.LiveTv
 
         private void UpdateTimersForSeriesPriority(SeriesTimerInfo seriesTimer)
         {
+            // Include cancelled episodes: a guide refresh or a new recording request can enable them
+            // again later, and they must not come back with an old priority.
             foreach (var timer in _timerManager.GetAll()
                 .Where(i => string.Equals(i.SeriesTimerId, seriesTimer.Id, StringComparison.OrdinalIgnoreCase))
-                .Where(i => i.Status is RecordingStatus.New or RecordingStatus.InProgress))
+                .Where(i => i.Status != RecordingStatus.Completed && i.Priority != seriesTimer.Priority))
             {
                 timer.Priority = seriesTimer.Priority;
-                _timerManager.AddOrUpdate(timer, false);
 
-                if (_recordingsManager.GetActiveRecordingPath(timer.Id) is not null)
-                {
-                    _recordingsManager.UpdateActiveRecordingTimer(timer);
-                }
+                // A priority change doesn't move the start, so the start timer is left as it is.
+                _timerManager.AddOrUpdate(timer, false);
             }
         }
 
@@ -731,10 +736,9 @@ namespace Jellyfin.LiveTv
                 var activeRecordingInfo = new ActiveRecordingInfo
                 {
                     CancellationTokenSource = new CancellationTokenSource(),
+                    Timer = timer,
                     Id = timer.Id
                 };
-
-                activeRecordingInfo.UpdateTimer(timer);
 
                 if (_recordingsManager.GetActiveRecordingPath(timer.Id) is not null)
                 {
@@ -759,7 +763,7 @@ namespace Jellyfin.LiveTv
                     CopyProgramInfoToTimerInfo(programInfo, timer);
                 }
 
-                await _recordingsManager.RecordStream(activeRecordingInfo, GetLiveTvChannel(timer))
+                await _recordingsManager.RecordStream(activeRecordingInfo, GetLiveTvChannel(timer), recordingEndDate)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -939,8 +943,8 @@ namespace Jellyfin.LiveTv
                         existingTimer.KeepUntil = seriesTimer.KeepUntil;
                         existingTimer.IsPostPaddingRequired = seriesTimer.IsPostPaddingRequired;
                         existingTimer.IsPrePaddingRequired = seriesTimer.IsPrePaddingRequired;
-                        existingTimer.PostPaddingSeconds = seriesTimer.PostPaddingSeconds;
-                        existingTimer.PrePaddingSeconds = seriesTimer.PrePaddingSeconds;
+                        existingTimer.PostPaddingSeconds = Math.Max(0, seriesTimer.PostPaddingSeconds);
+                        existingTimer.PrePaddingSeconds = Math.Max(0, seriesTimer.PrePaddingSeconds);
                         existingTimer.Priority = seriesTimer.Priority;
                         existingTimer.SeriesTimerId = seriesTimer.Id;
                     }
@@ -1044,8 +1048,8 @@ namespace Jellyfin.LiveTv
                 StartDate = parent.StartDate,
                 EndDate = parent.EndDate.Value,
                 ProgramId = parent.ExternalId,
-                PrePaddingSeconds = seriesTimer.PrePaddingSeconds,
-                PostPaddingSeconds = seriesTimer.PostPaddingSeconds,
+                PrePaddingSeconds = Math.Max(0, seriesTimer.PrePaddingSeconds),
+                PostPaddingSeconds = Math.Max(0, seriesTimer.PostPaddingSeconds),
                 IsPostPaddingRequired = seriesTimer.IsPostPaddingRequired,
                 IsPrePaddingRequired = seriesTimer.IsPrePaddingRequired,
                 KeepUntil = seriesTimer.KeepUntil,

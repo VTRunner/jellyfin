@@ -104,6 +104,13 @@ namespace MediaBrowser.Controller.LiveTv
         Task<IReadOnlyList<RecordingScheduleForecastDto>> GetRecordingScheduleForecast(CancellationToken cancellationToken);
 
         /// <summary>
+        /// Gets the sessions that are watching live TV, with the tuner hosts their live streams use. They are not
+        /// part of the recording forecast.
+        /// </summary>
+        /// <returns>The sessions that are watching live TV.</returns>
+        IReadOnlyList<LiveTvTunerSessionDto> GetLiveTvTunerSessions();
+
+        /// <summary>
         /// Gets the series timers.
         /// </summary>
         /// <param name="query">The query.</param>

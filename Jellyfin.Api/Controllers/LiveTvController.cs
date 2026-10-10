@@ -525,6 +525,20 @@ public class LiveTvController : BaseJellyfinApiController
     }
 
     /// <summary>
+    /// Gets the sessions that are watching live TV, with the tuner hosts their live streams use, so that tuner use
+    /// can be shown with the recording schedule. They are not part of the recording forecast.
+    /// </summary>
+    /// <response code="200">Live TV sessions returned.</response>
+    /// <returns>An <see cref="OkResult"/> containing the sessions that are watching live TV.</returns>
+    [HttpGet("TunerSessions")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [Authorize(Policy = Policies.LiveTvManagement)]
+    public ActionResult<IReadOnlyList<LiveTvTunerSessionDto>> GetLiveTvTunerSessions()
+    {
+        return Ok(_liveTvManager.GetLiveTvTunerSessions());
+    }
+
+    /// <summary>
     /// Gets available live tv epgs.
     /// </summary>
     /// <param name="channelIds">The channels to return guide information for.</param>
@@ -881,6 +895,7 @@ public class LiveTvController : BaseJellyfinApiController
     /// <param name="entryType">Entry type. Use Timer or Series.</param>
     /// <param name="entryId">Internal timer or series timer id.</param>
     /// <response code="204">Priority changed.</response>
+    /// <returns>A <see cref="NoContentResult"/>.</returns>
     [HttpPost("RecordingPriority/{entryType}/{entryId}/Up")]
     [Authorize(Policy = Policies.LiveTvManagement)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
@@ -902,6 +917,7 @@ public class LiveTvController : BaseJellyfinApiController
     /// <param name="entryType">Entry type. Use Timer or Series.</param>
     /// <param name="entryId">Internal timer or series timer id.</param>
     /// <response code="204">Priority changed.</response>
+    /// <returns>A <see cref="NoContentResult"/>.</returns>
     [HttpPost("RecordingPriority/{entryType}/{entryId}/Down")]
     [Authorize(Policy = Policies.LiveTvManagement)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]

@@ -8,13 +8,13 @@ using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using AsyncKeyedLock;
 using Jellyfin.Data;
 using Jellyfin.Data.Enums;
 using Jellyfin.Data.Events;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.LiveTv.Configuration;
+using Jellyfin.LiveTv.Recordings;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Configuration;
@@ -22,6 +22,7 @@ using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
+using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.Sorting;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
@@ -46,6 +47,9 @@ namespace Jellyfin.LiveTv
         private readonly ILocalizationManager _localization;
         private readonly IChannelManager _channelManager;
         private readonly IRecordingsManager _recordingsManager;
+        private readonly IActiveRecordingTunerProvider _activeRecordingTunerProvider;
+        private readonly ISessionManager _sessionManager;
+        private readonly IMediaSourceManager _mediaSourceManager;
         private readonly LiveTvDtoService _tvDtoService;
         private readonly RecordingScheduleForecastEngine _recordingScheduleForecastEngine;
         private readonly ILiveTvService[] _services;
@@ -60,6 +64,9 @@ namespace Jellyfin.LiveTv
             ILocalizationManager localization,
             IChannelManager channelManager,
             IRecordingsManager recordingsManager,
+            IActiveRecordingTunerProvider activeRecordingTunerProvider,
+            ISessionManager sessionManager,
+            IMediaSourceManager mediaSourceManager,
             LiveTvDtoService liveTvDtoService,
             IEnumerable<ILiveTvService> services)
         {
@@ -73,6 +80,9 @@ namespace Jellyfin.LiveTv
             _channelManager = channelManager;
             _tvDtoService = liveTvDtoService;
             _recordingsManager = recordingsManager;
+            _activeRecordingTunerProvider = activeRecordingTunerProvider;
+            _sessionManager = sessionManager;
+            _mediaSourceManager = mediaSourceManager;
             _services = services.ToArray();
             _recordingScheduleForecastEngine = new RecordingScheduleForecastEngine(_config);
 
@@ -819,9 +829,9 @@ namespace Jellyfin.LiveTv
 
         public async Task<IReadOnlyList<RecordingScheduleForecastDto>> GetRecordingScheduleForecast(CancellationToken cancellationToken)
         {
-            var activeTunerHosts = _recordingsManager.GetActiveRecordings()
-                .Where(i => !string.IsNullOrWhiteSpace(i.TunerHostId))
-                .ToDictionary(i => i.Id, i => i.TunerHostId, StringComparer.OrdinalIgnoreCase);
+            // Keyed by the timer ids of the default service, the only service that records through
+            // the recordings manager. They are not the internal ids that the forecast reports.
+            var activeTunerHosts = _activeRecordingTunerProvider.GetActiveRecordingTunerHostIds();
 
             var tasks = _services.Select(async service =>
             {
@@ -838,7 +848,8 @@ namespace Jellyfin.LiveTv
                             ChannelNumber = GetForecastChannelNumber(service, timer.ChannelId),
                             SeriesTimerId = timer.SeriesTimerId,
                             TunerHostId = timer.Status == RecordingStatus.InProgress
-                                && activeTunerHosts.TryGetValue(_tvDtoService.GetInternalTimerId(timer.Id), out var tunerHostId)
+                                && service is DefaultLiveTvService
+                                && activeTunerHosts.TryGetValue(timer.Id, out var tunerHostId)
                                 ? tunerHostId
                                 : null,
                             StartDate = timer.StartDate,
@@ -846,7 +857,6 @@ namespace Jellyfin.LiveTv
                             Priority = timer.Priority,
                             PrePaddingSeconds = Math.Max(timer.PrePaddingSeconds, 0),
                             PostPaddingSeconds = Math.Max(timer.PostPaddingSeconds, 0),
-                            IsPostPaddingRequired = timer.IsPostPaddingRequired,
                             Status = timer.Status,
                             Service = service
                         });
@@ -861,6 +871,71 @@ namespace Jellyfin.LiveTv
             return await _recordingScheduleForecastEngine
                 .ForecastAsync(results.SelectMany(i => i).ToArray(), DateTime.UtcNow, cancellationToken)
                 .ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<LiveTvTunerSessionDto> GetLiveTvTunerSessions()
+        {
+            var sessions = _sessionManager.Sessions
+                .Where(session => session.NowPlayingItem?.Type == BaseItemKind.TvChannel)
+                .ToList();
+            if (sessions.Count == 0)
+            {
+                return [];
+            }
+
+            // Tuner hosts are numbered as the recording forecast numbers them.
+            var tunerHosts = _config.GetLiveTvConfiguration().TunerHosts
+                .Where(host => !string.IsNullOrWhiteSpace(host.Id))
+                .ToArray();
+
+            var now = DateTime.UtcNow;
+            var programs = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                IncludeItemTypes = [BaseItemKind.LiveTvProgram],
+                ChannelIds = sessions.Select(session => session.NowPlayingItem.Id).Distinct().ToArray(),
+                MaxStartDate = now,
+                MinEndDate = now,
+                OrderBy = [(ItemSortBy.StartDate, SortOrder.Ascending)],
+                DtoOptions = new DtoOptions(false)
+            }).OfType<LiveTvProgram>().ToList();
+
+            return sessions
+                .Select(session =>
+                {
+                    var channel = session.NowPlayingItem;
+                    var program = programs.Find(i => channel.Id.Equals(i.ChannelId));
+
+                    // The live stream knows the tuner host it was opened on. A client that doesn't report its live
+                    // stream leaves the tuner host unknown.
+                    var liveStreamId = session.PlayState?.LiveStreamId;
+                    var tunerHostId = string.IsNullOrEmpty(liveStreamId)
+                        ? null
+                        : _mediaSourceManager.GetLiveStreamInfo(liveStreamId)?.TunerHostId;
+                    var hostIndex = string.IsNullOrEmpty(tunerHostId)
+                        ? -1
+                        : Array.FindIndex(tunerHosts, host => string.Equals(host.Id, tunerHostId, StringComparison.OrdinalIgnoreCase));
+                    var tunerHost = hostIndex >= 0 ? tunerHosts[hostIndex] : null;
+
+                    return new LiveTvTunerSessionDto
+                    {
+                        SessionId = session.Id,
+                        UserName = session.UserName,
+                        DeviceName = session.DeviceName,
+                        Client = session.Client,
+                        ChannelId = channel.Id,
+                        ChannelName = channel.Name,
+                        ChannelNumber = channel.ChannelNumber ?? channel.Number,
+                        ProgramName = program?.Name,
+                        ProgramStartDate = program?.StartDate,
+                        ProgramEndDate = program?.EndDate,
+                        TunerHostId = tunerHost?.Id ?? tunerHostId,
+                        TunerHostName = tunerHost?.FriendlyName,
+                        TunerHostType = tunerHost?.Type,
+                        TunerHostIndex = tunerHost is null ? null : hostIndex + 1
+                    };
+                })
+                .ToArray();
         }
 
         private string GetForecastChannelNumber(ILiveTvService service, string channelId)
@@ -1079,41 +1154,6 @@ namespace Jellyfin.LiveTv
                 entry.Timer.Priority = entry.Priority;
                 await entry.Service.UpdateTimerAsync(entry.Timer, cancellationToken).ConfigureAwait(false);
             }
-        }
-
-        private sealed class RecordingPriorityEntry
-        {
-            public RecordingPriorityEntry(
-                bool isSeries,
-                string id,
-                string externalId,
-                int priority,
-                DateTime startDate,
-                string name,
-                ILiveTvService service,
-                SeriesTimerInfo seriesTimer,
-                TimerInfo timer)
-            {
-                IsSeries = isSeries;
-                Id = id;
-                ExternalId = externalId;
-                Priority = priority;
-                StartDate = startDate;
-                Name = name;
-                Service = service;
-                SeriesTimer = seriesTimer;
-                Timer = timer;
-            }
-
-            public bool IsSeries { get; }
-            public string Id { get; }
-            public string ExternalId { get; }
-            public int Priority { get; set; }
-            public DateTime StartDate { get; }
-            public string Name { get; }
-            public ILiveTvService Service { get; }
-            public SeriesTimerInfo SeriesTimer { get; }
-            public TimerInfo Timer { get; }
         }
 
         private async Task<QueryResult<SeriesTimerInfo>> GetSeriesTimersInternal(SeriesTimerQuery query, CancellationToken cancellationToken)
@@ -1581,6 +1621,49 @@ namespace Jellyfin.LiveTv
             folders.AddRange(channels.Items);
 
             return folders.Cast<BaseItem>().ToArray();
+        }
+
+        private sealed class RecordingPriorityEntry
+        {
+            public RecordingPriorityEntry(
+                bool isSeries,
+                string id,
+                string externalId,
+                int priority,
+                DateTime startDate,
+                string name,
+                ILiveTvService service,
+                SeriesTimerInfo seriesTimer,
+                TimerInfo timer)
+            {
+                IsSeries = isSeries;
+                Id = id;
+                ExternalId = externalId;
+                Priority = priority;
+                StartDate = startDate;
+                Name = name;
+                Service = service;
+                SeriesTimer = seriesTimer;
+                Timer = timer;
+            }
+
+            public bool IsSeries { get; }
+
+            public string Id { get; }
+
+            public string ExternalId { get; }
+
+            public int Priority { get; set; }
+
+            public DateTime StartDate { get; }
+
+            public string Name { get; }
+
+            public ILiveTvService Service { get; }
+
+            public SeriesTimerInfo SeriesTimer { get; }
+
+            public TimerInfo Timer { get; }
         }
     }
 }

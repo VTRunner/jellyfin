@@ -134,6 +134,7 @@ namespace Jellyfin.LiveTv.TunerHosts
 
             return [];
         }
+
         public async Task<List<ChannelInfo>> GetChannels(bool enableCache, CancellationToken cancellationToken)
         {
             var list = new List<ChannelInfo>();

@@ -1,6 +1,8 @@
 #nullable disable
 #pragma warning disable CS1591
 
+using System;
+
 namespace MediaBrowser.Model.LiveTv;
 
 /// <summary>
@@ -14,7 +16,8 @@ public class RecordingScheduleForecastDto
     public string TimerId { get; set; }
 
     /// <summary>
-    /// Gets or sets the forecast status.
+    /// Gets or sets the forecast status: <c>WillRecord</c>, <c>StartsLate</c>, <c>StopsEarly</c>,
+    /// <c>PaddingAtRisk</c>, <c>Conflict</c> or <c>Unknown</c>.
     /// </summary>
     public string ForecastStatus { get; set; }
 
@@ -26,12 +29,25 @@ public class RecordingScheduleForecastDto
     /// <summary>
     /// Gets or sets the effective recording start time, including pre-padding.
     /// </summary>
-    public global::System.DateTime EffectiveStart { get; set; }
+    public DateTime EffectiveStart { get; set; }
 
     /// <summary>
     /// Gets or sets the effective recording end time, including post-padding.
     /// </summary>
-    public global::System.DateTime EffectiveEnd { get; set; }
+    public DateTime EffectiveEnd { get; set; }
+
+    /// <summary>
+    /// Gets or sets when a recording that starts late is expected to start, after waiting for a tuner.
+    /// It is only set when <see cref="ForecastStatus"/> is <c>StartsLate</c>.
+    /// </summary>
+    public DateTime? ExpectedStart { get; set; }
+
+    /// <summary>
+    /// Gets or sets when a recording is expected to stop before its program ends, because a recording
+    /// with a higher priority needs its tuner.
+    /// It is only set when <see cref="ForecastStatus"/> is <c>StopsEarly</c>.
+    /// </summary>
+    public DateTime? ExpectedEnd { get; set; }
 
     /// <summary>
     /// Gets or sets the number of compatible tuner slots configured for this recording.
@@ -71,17 +87,17 @@ public class RecordingScheduleForecastDto
     public int? TunerSlotIndex { get; set; }
 
     /// <summary>
-    /// Gets or sets the timer identifier that blocked this recording or caused optional padding to be preempted.
+    /// Gets or sets the timer identifier that blocked this recording, or that stops it or its post-padding early.
     /// </summary>
     public string BlockedByTimerId { get; set; }
 
     /// <summary>
-    /// Gets or sets the name of the timer that blocked this recording or caused optional padding to be preempted.
+    /// Gets or sets the name of the timer that blocked this recording, or that stops it or its post-padding early.
     /// </summary>
     public string BlockedByName { get; set; }
 
     /// <summary>
-    /// Gets or sets the priority of the timer that blocked this recording or caused optional padding to be preempted.
+    /// Gets or sets the priority of the timer that blocked this recording, or that stops it or its post-padding early.
     /// </summary>
     public int? BlockedByPriority { get; set; }
 }
